@@ -30,6 +30,8 @@ export HF_HOME="/workspace"
 chmod +x RunPod_Install.sh
 ./RunPod_Install.sh
 
+The install script will clone https://github.com/mikeymcfish/IndexTTS2, set up the Python virtual environment, install FFmpeg to the system PATH when needed, install all Python requirements, and download the required checkpoints into /workspace/IndexTTS2/checkpoints.
+
 After running the app it will download few additional models
 
 Just run the app again if your download fails for any reason
@@ -39,11 +41,11 @@ To use after install
 Open a new terminal and run below code to start every time
 
 unset LD_LIBRARY_PATH
-cd /workspace/index-tts
+cd /workspace/IndexTTS2
 export HF_HOME="/workspace"
 export PYTHONWARNINGS=ignore
-git reset --hard
-git pull
+git fetch origin
+git reset --hard origin/main
 source ./venv/bin/activate
 python webui.py --share
 

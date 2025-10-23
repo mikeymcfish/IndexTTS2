@@ -13,7 +13,7 @@ import shutil
 import json
 
 # Configuration
-TARGET_DIR = "index-tts/checkpoints"
+TARGET_DIR = Path(__file__).resolve().parent / "checkpoints"
 
 # Model configurations
 MODEL_CONFIGS = {
@@ -1224,7 +1224,7 @@ def download_models(download_dir: Optional[str] = None, model_type: Optional[str
             return
 
     # Don't create subfolder-specific target directory - download directly to target_dir
-    # All files from Index_TTS2 will be downloaded directly into index-tts/checkpoints
+    # All files from Index_TTS2 will be downloaded directly into checkpoints within the repository
 
     # Check existing files with SHA256 verification
     to_download = []
@@ -1304,8 +1304,8 @@ def download_models(download_dir: Optional[str] = None, model_type: Optional[str
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Download Index TTS models')
-    parser.add_argument('--dir', type=str,
-                       help='Download directory (default: index-tts/checkpoints)')
+    parser.add_argument('--dir', type=str, default=None,
+                       help=f'Download directory (default: {TARGET_DIR})')
     parser.add_argument('--model', type=str, choices=['index_tts'],
                        help='Model type to download: index_tts')
 

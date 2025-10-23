@@ -1,23 +1,47 @@
-git clone https://github.com/FurkanGozukara/index-tts
+#!/bin/bash
+set -euo pipefail
 
-cd index-tts
+REPO_URL="https://github.com/mikeymcfish/IndexTTS2.git"
+REPO_DIR="IndexTTS2"
 
-git reset --hard
+# Clone the repository if it is not already present
+if [ ! -d "${REPO_DIR}/.git" ]; then
+    git clone "${REPO_URL}" "${REPO_DIR}"
+fi
 
-git pull
+cd "${REPO_DIR}"
 
-python -m venv venv
+git fetch origin
+DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
+if [ -z "${DEFAULT_BRANCH}" ]; then
+    DEFAULT_BRANCH="main"
+fi
 
-source ./venv/bin/activate
+git checkout "${DEFAULT_BRANCH}"
+git reset --hard "origin/${DEFAULT_BRANCH}"
 
-python -m pip install --upgrade pip
+# Create (or reuse) a virtual environment
+python3 -m venv venv
+source venv/bin/activate
 
-cd ..
+python -m pip install --upgrade pip setuptools wheel
 
-pip install -r requirements.txt
+# Install FFmpeg if it is not already available
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1; then
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+    else
+        apt-get update
+        apt-get install -y ffmpeg
+    fi
+fi
+
+python -m pip install -r requirements.txt
 
 export HF_HUB_ENABLE_HF_TRANSFER=1
-
 python HF_model_downloader.py
 
-echo all installed successfully
+deactivate || true
+
+echo "All installed successfully"
