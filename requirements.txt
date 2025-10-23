@@ -50,6 +50,7 @@ tqdm>=4.67.1
 transformers==4.52.1
 hf_xet
 pydub
+mutagen>=1.47.0
 # Platform-specific dependencies
 wetext>=0.0.9; sys_platform != 'linux'
 WeTextProcessing; sys_platform == 'linux'
