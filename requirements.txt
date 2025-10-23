@@ -1,0 +1,61 @@
+
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch==2.8.0
+torchvision
+torchaudio
+
+flash_attn @ https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/flash_attn-2.8.2-cp310-cp310-win_amd64.whl ; sys_platform == 'win32'
+
+flash_attn @ https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/flash_attn-2.8.2-cp310-cp310-linux_x86_64.whl ; sys_platform == 'linux'
+
+xformers @ https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/xformers-0.0.33+c159edc0.d20250906-cp39-abi3-win_amd64.whl ; sys_platform == 'win32'
+
+xformers @ https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/xformers-0.0.33+c159edc0.d20250906-cp39-abi3-linux_x86_64.whl ; sys_platform == 'linux'
+
+# deepspeed @ https://files.pythonhosted.org/packages/3d/65/1a6394f5d6dee851e9ea59e385f6d6428e3bfe36f83c06e0336e14dcfd11/deepspeed-0.16.4-cp310-cp310-win_amd64.whl ; sys_platform == 'win32'
+
+# deepspeed ; sys_platform == 'linux'
+
+sageattention @ https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/sageattention-2.2.0-cp39-abi3-linux_x86_64.whl ; sys_platform == 'linux'
+
+sageattention @ https://huggingface.co/MonsterMMORPG/Wan_GGUF/resolve/main/sageattention-2.2.0-cp39-abi3-win_amd64.whl ; sys_platform == 'win32'
+
+triton-windows<3.5 ; sys_platform == 'win32'
+
+accelerate==1.8.1
+cn2an==0.5.22
+cython==3.0.7
+descript-audiotools==0.7.2
+einops>=0.8.1
+ffmpeg-python==0.2.0
+g2p-en==2.1.0
+jieba==0.42.1
+json5==0.10.0
+keras==2.9.0
+librosa==0.10.2.post1
+matplotlib==3.8.2
+modelscope==1.27.0
+munch==4.0.0
+numba==0.58.1
+numpy==1.26.2
+omegaconf>=2.3.0
+opencv-python==4.9.0.80
+pandas==2.3.2
+safetensors==0.5.2
+sentencepiece>=0.2.1
+tensorboard==2.9.1
+textstat>=0.7.10
+tokenizers==0.21.0
+tqdm>=4.67.1
+transformers==4.52.1
+hf_xet
+pydub
+# Platform-specific dependencies
+wetext>=0.0.9; sys_platform != 'linux'
+WeTextProcessing; sys_platform == 'linux'
+
+# Optional: WebUI support
+gradio==5.45.0
+
+# Optional: DeepSpeed support  
+# deepspeed==0.17.1
