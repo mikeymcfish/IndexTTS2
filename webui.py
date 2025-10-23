@@ -332,8 +332,8 @@ def apply_chapters_to_mp3(mp3_path, text, chapters):
             end_time=end_ms,
             start_offset=0,
             end_offset=0,
+            sub_frames=[TIT2(encoding=3, text=chapter["title"])],
         )
-        chap_frame.add(TIT2(encoding=3, text=chapter["title"]))
         audio.tags.add(chap_frame)
         element_ids.append(element_id)
 
@@ -835,6 +835,27 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                         interactive=False,
                         visible=False
                     )
+
+        with gr.Accordion("Chapter Settings", open=False):
+            enable_chapters = gr.Checkbox(
+                label="Enable MP3 Chapters",
+                value=False,
+                info="When enabled, matches in the regex below will become chapter markers embedded into the exported MP3.",
+            )
+            chapter_regex_input = gr.Textbox(
+                label="Chapter Start Regex",
+                value=r"^Chapter\s+\d+",
+                placeholder=r"e.g., ^Chapter \d+",
+                info="Provide a regular expression that matches the beginning of each chapter. Use multiline mode constructs such as ^ for line starts.",
+            )
+            chapter_error = gr.Markdown(value="", visible=False)
+            chapter_preview = gr.Dataframe(
+                headers=["Chapter #", "Title", "Start Char", "Preview Start"],
+                interactive=False,
+                visible=False,
+                type="array",
+            )
+            chapter_status = gr.Markdown(value="", visible=False)
 
         with gr.Accordion("Function Settings"):
             # 情感控制选项部分 - now showing ALL options including experimental
