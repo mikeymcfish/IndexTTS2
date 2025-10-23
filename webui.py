@@ -83,6 +83,47 @@ os.makedirs("outputs/used_audios",exist_ok=True)
 MAX_LENGTH_TO_USE_SPEED = 70
 TEXT_FILE_SIZE_LIMIT = 2 * 1024 * 1024  # 2 MB limit for uploaded text files
 
+# Console logging helpers for long-running segmentation previews
+def log_segmentation_progress(prefix, processed, total, start_time, last_log_time=None, min_interval=1.0):
+    """Log incremental segmentation progress with ETA estimation."""
+    if total <= 0:
+        return last_log_time
+
+    now = time.perf_counter()
+    if processed == total or last_log_time is None or (now - last_log_time) >= min_interval:
+        elapsed = max(now - start_time, 1e-6)
+        rate = processed / elapsed
+        remaining = total - processed
+        if remaining <= 0:
+            eta_str = "0.0s"
+        elif rate > 0:
+            eta = remaining / rate
+            eta_str = f"{eta:.1f}s"
+        else:
+            eta_str = "estimating..."
+
+        print(
+            f"[{prefix}] {processed}/{total} segments processed "
+            f"({elapsed:.1f}s elapsed, ETA {eta_str})"
+        )
+        return now
+
+    return last_log_time
+
+
+def log_segmentation_summary(prefix, total_segments, total_tokens, elapsed):
+    """Log a summary line for segmentation work."""
+    elapsed = max(elapsed, 1e-6)
+    if total_segments:
+        rate = total_segments / elapsed
+        print(
+            f"[{prefix}] Completed {total_segments} segments "
+            f"({total_tokens} tokens) in {elapsed:.2f}s ({rate:.2f} seg/s)"
+        )
+    else:
+        print(f"[{prefix}] No segments produced (elapsed {elapsed:.2f}s)")
+
+
 # Try to import pydub for MP3 export
 try:
     from pydub import AudioSegment
@@ -226,22 +267,27 @@ def parse_max_tokens(max_text_tokens_per_segment):
         return 120
 
 
-def build_segments_preview_data(text, max_tokens):
+def build_segments_preview_data(text, max_tokens, log_prefix="Segmentation preview (standard)"):
     """Build preview rows for segmented text."""
     if not text or not text.strip():
         return []
 
     try:
+        start_time = time.perf_counter()
         text_tokens_list = tts.tokenizer.tokenize(text)
         segments = tts.tokenizer.split_segments(
             text_tokens_list,
             max_text_tokens_per_segment=max_tokens,
         )
         data = []
+        total_tokens = 0
         for i, segment_tokens in enumerate(segments):
             segment_str = ''.join(segment_tokens)
             tokens_count = len(segment_tokens)
+            total_tokens += tokens_count
             data.append([i, segment_str, tokens_count])
+        elapsed = time.perf_counter() - start_time
+        log_segmentation_summary(log_prefix, len(segments), total_tokens, elapsed)
         return data
     except Exception as exc:
         print(f"Error building segments preview: {exc}")
@@ -993,7 +1039,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             with gr.Row():
                 save_as_mp3 = gr.Checkbox(
                     label="Save as MP3",
-                    value=False,
+                    value=MP3_AVAILABLE,
                     visible=MP3_AVAILABLE,
                     info="Save audio as MP3 format instead of WAV" if MP3_AVAILABLE else "Requires pydub: pip install pydub"
                 )
@@ -1327,11 +1373,10 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             )
 
     def load_text_file_contents(text_file, max_text_tokens_per_segment, preview_mode,
-                                enable_chapters, chapter_regex):
+                                enable_chapters, chapter_regex, progress=gr.Progress(track_tqdm=True)):
         """Load text content from an uploaded .txt file."""
-        _ = preview_mode  # Included for consistent signature; standard processing is used here.
         if not text_file:
-            return (
+            yield (
                 gr.update(),
                 gr.update(),
                 gr.update(value="", visible=False),
@@ -1340,10 +1385,11 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 [],
                 gr.update(value="", visible=False),
             )
+            return
 
         file_path = text_file if isinstance(text_file, str) else getattr(text_file, "name", None)
         if not file_path or not os.path.exists(file_path):
-            return (
+            yield (
                 gr.update(),
                 gr.update(),
                 gr.update(value="Text file not found.", visible=True),
@@ -1352,14 +1398,16 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 [],
                 gr.update(value="", visible=False),
             )
+            return
 
         try:
+            progress(0.0, desc="Reading text file")
             if TEXT_FILE_SIZE_LIMIT and os.path.getsize(file_path) > TEXT_FILE_SIZE_LIMIT:
                 file_status = gr.update(
                     value=f"⚠️ Text file is larger than {TEXT_FILE_SIZE_LIMIT // (1024 * 1024)} MB. Please use a smaller file.",
                     visible=True,
                 )
-                return (
+                yield (
                     gr.update(),
                     gr.update(),
                     file_status,
@@ -1368,6 +1416,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                     [],
                     gr.update(value="", visible=False),
                 )
+                return
 
             content = None
             for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
@@ -1383,9 +1432,6 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                     content = handle.read()
 
             max_tokens = parse_max_tokens(max_text_tokens_per_segment)
-            segments_data = build_segments_preview_data(content, max_tokens)
-            segments_update = gr.update(value=segments_data, visible=True, type="array")
-
             chapter_matches, chapter_error_msg, chapter_rows, table_visible = compute_chapter_preview_data(
                 enable_chapters,
                 content,
@@ -1408,7 +1454,88 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 visible=True,
             )
 
-            return (
+            if preview_mode == "Experimental (progressive)":
+                progress(0.1, desc="Tokenizing text")
+                overall_start = time.perf_counter()
+                tokenized = tts.tokenizer.tokenize(content)
+                progress(0.25, desc="Splitting into segments")
+                segments = tts.tokenizer.split_segments(
+                    tokenized,
+                    max_text_tokens_per_segment=max_tokens,
+                )
+                total_segments = len(segments)
+                total_tokens = sum(len(seg) for seg in segments)
+                prep_elapsed = time.perf_counter() - overall_start
+                print(
+                    f"[Segmentation preview (experimental/file)] Prepared {total_segments} segments "
+                    f"({total_tokens} tokens) in {prep_elapsed:.2f}s. Streaming updates..."
+                )
+
+                preview_rows = []
+                stream_start = time.perf_counter()
+                last_log_time = None
+
+                yield (
+                    gr.update(value=content),
+                    gr.update(value=[], visible=True, type="array"),
+                    file_status,
+                    chapter_table_update,
+                    chapter_error_update,
+                    chapter_matches,
+                    gr.update(value="", visible=False),
+                )
+
+                if total_segments == 0:
+                    progress(1.0, desc="No segments found")
+                    log_segmentation_summary(
+                        "Segmentation preview (experimental/file)",
+                        total_segments,
+                        total_tokens,
+                        time.perf_counter() - overall_start,
+                    )
+                    return
+
+                for idx, segment_tokens in enumerate(segments):
+                    segment_str = ''.join(segment_tokens)
+                    tokens_count = len(segment_tokens)
+                    preview_rows.append([idx, segment_str, tokens_count])
+                    progress(0.25 + 0.7 * ((idx + 1) / total_segments), desc=f"Building preview ({idx + 1}/{total_segments})")
+                    last_log_time = log_segmentation_progress(
+                        "Segmentation preview (experimental/file)",
+                        idx + 1,
+                        total_segments,
+                        stream_start,
+                        last_log_time,
+                    )
+                    yield (
+                        gr.update(),
+                        gr.update(value=list(preview_rows), visible=True, type="array"),
+                        gr.update(),
+                        gr.update(),
+                        gr.update(),
+                        chapter_matches,
+                        gr.update(value="", visible=False),
+                    )
+
+                progress(1.0, desc="Preview ready")
+                log_segmentation_summary(
+                    "Segmentation preview (experimental/file)",
+                    total_segments,
+                    total_tokens,
+                    time.perf_counter() - overall_start,
+                )
+                return
+
+            segments_data = build_segments_preview_data(
+                content,
+                max_tokens,
+                log_prefix="Segmentation preview (standard/file)",
+            )
+            segments_update = gr.update(value=segments_data, visible=True, type="array")
+
+            progress(1.0, desc="Preview ready")
+
+            yield (
                 gr.update(value=content),
                 segments_update,
                 file_status,
@@ -1417,8 +1544,9 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 chapter_matches,
                 gr.update(value="", visible=False),
             )
+            return
         except Exception as exc:
-            return (
+            yield (
                 gr.update(),
                 gr.update(),
                 gr.update(value=f"Failed to load text file: {exc}", visible=True),
@@ -1427,6 +1555,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 [],
                 gr.update(value="", visible=False),
             )
+            return
 
     def update_chapter_preview(enable_chapters, text, chapter_regex):
         """Update chapter preview table when text or regex changes."""
@@ -1463,12 +1592,19 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
         if preview_mode == "Experimental (progressive)":
             try:
+                overall_start = time.perf_counter()
                 progress(0.0, desc="Tokenizing text")
                 text_tokens_list = tts.tokenizer.tokenize(sanitized_text)
                 progress(0.2, desc="Splitting into segments")
                 segments = tts.tokenizer.split_segments(
                     text_tokens_list,
                     max_text_tokens_per_segment=max_tokens,
+                )
+                total_tokens = sum(len(segment_tokens) for segment_tokens in segments)
+                prep_elapsed = time.perf_counter() - overall_start
+                print(
+                    f"[Segmentation preview (experimental)] Prepared {len(segments)} segments "
+                    f"({total_tokens} tokens) in {prep_elapsed:.2f}s. Streaming updates..."
                 )
             except Exception as exc:
                 progress(1.0, desc="Failed to build preview")
@@ -1487,18 +1623,37 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 return
 
             preview_rows = []
+            stream_start = time.perf_counter()
+            last_log_time = None
             for idx, segment_tokens in enumerate(segments):
                 segment_str = ''.join(segment_tokens)
                 tokens_count = len(segment_tokens)
                 preview_rows.append([idx, segment_str, tokens_count])
                 progress(0.2 + 0.7 * ((idx + 1) / total_segments), desc=f"Building preview ({idx + 1}/{total_segments})")
+                last_log_time = log_segmentation_progress(
+                    "Segmentation preview (experimental)",
+                    idx + 1,
+                    total_segments,
+                    stream_start,
+                    last_log_time,
+                )
                 yield {
                     segments_preview: gr.update(value=list(preview_rows), visible=True, type="array"),
                 }
 
             progress(1.0, desc="Preview ready")
+            log_segmentation_summary(
+                "Segmentation preview (experimental)",
+                total_segments,
+                total_tokens,
+                time.perf_counter() - overall_start,
+            )
         else:
-            data = build_segments_preview_data(sanitized_text, max_tokens)
+            data = build_segments_preview_data(
+                sanitized_text,
+                max_tokens,
+                log_prefix="Segmentation preview (standard)",
+            )
             yield {
                 segments_preview: gr.update(value=data, visible=True, type="array"),
             }
