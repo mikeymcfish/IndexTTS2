@@ -408,6 +408,9 @@ class IndexTTS2:
 
         return wavs_list
 
+    def _console_log(self, message):
+        print(message, flush=True)
+
     def _set_gr_progress(self, value, desc):
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
@@ -660,6 +663,12 @@ class IndexTTS2:
         text_tokens_list = self.tokenizer.tokenize(text)
         segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
         segments_count = len(segments)
+        if segments_count:
+            self._console_log(
+                f"[Generation] Starting synthesis for {segments_count} segment{'s' if segments_count != 1 else ''}."
+            )
+        else:
+            self._console_log("[Generation] No segments found; nothing to synthesize.")
         if verbose:
             print("text_tokens_list:", text_tokens_list)
             print("segments count:", segments_count)
@@ -682,7 +691,9 @@ class IndexTTS2:
         s2mel_time = 0
         bigvgan_time = 0
         has_warned = False
+        synthesis_start = time.perf_counter()
         for seg_idx, sent in enumerate(segments):
+            segment_start_time = time.perf_counter()
             self._set_gr_progress(0.2 + 0.7 * seg_idx / segments_count,
                                   f"speech synthesis {seg_idx + 1}/{segments_count}...")
 
@@ -873,7 +884,30 @@ class IndexTTS2:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
                 # wavs.append(wav[:, :-512])
                 wavs.append(wav.cpu())  # to cpu before saving
+
+            now = time.perf_counter()
+            processed_segments = seg_idx + 1
+            remaining_segments = max(segments_count - processed_segments, 0)
+            elapsed_since_start = now - synthesis_start
+            segment_elapsed = now - segment_start_time
+            if processed_segments > 0 and remaining_segments > 0:
+                avg_time = elapsed_since_start / processed_segments
+                eta_seconds = avg_time * remaining_segments
+                eta_str = f"{eta_seconds:.1f}s"
+            else:
+                eta_str = "0.0s"
+            self._console_log(
+                f"[Generation] Finished segment {processed_segments}/{segments_count} in {segment_elapsed:.2f}s "
+                f"({elapsed_since_start:.1f}s elapsed, {remaining_segments} remaining, ETA {eta_str})."
+            )
         end_time = time.perf_counter()
+        synthesis_elapsed = end_time - synthesis_start
+        if segments_count:
+            avg_segment_time = synthesis_elapsed / segments_count
+            self._console_log(
+                f"[Generation] Completed synthesis of {segments_count} segments in {synthesis_elapsed:.2f}s "
+                f"(avg {avg_segment_time:.2f}s/segment)."
+            )
 
         self._set_gr_progress(0.9, "saving audio...")
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)

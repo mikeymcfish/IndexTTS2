@@ -16,6 +16,11 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
+
+def console_log(message):
+    """Emit console logs immediately so users can see progress."""
+    print(message, flush=True)
+
 # pandas removed - not needed, using native list format instead
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -102,7 +107,7 @@ def log_segmentation_progress(prefix, processed, total, start_time, last_log_tim
         else:
             eta_str = "estimating..."
 
-        print(
+        console_log(
             f"[{prefix}] {processed}/{total} segments processed "
             f"({elapsed:.1f}s elapsed, ETA {eta_str})"
         )
@@ -116,12 +121,12 @@ def log_segmentation_summary(prefix, total_segments, total_tokens, elapsed):
     elapsed = max(elapsed, 1e-6)
     if total_segments:
         rate = total_segments / elapsed
-        print(
+        console_log(
             f"[{prefix}] Completed {total_segments} segments "
             f"({total_tokens} tokens) in {elapsed:.2f}s ({rate:.2f} seg/s)"
         )
     else:
-        print(f"[{prefix}] No segments produced (elapsed {elapsed:.2f}s)")
+        console_log(f"[{prefix}] No segments produced (elapsed {elapsed:.2f}s)")
 
 
 # Try to import pydub for MP3 export
@@ -242,6 +247,20 @@ def convert_wav_to_mp3(wav_path, mp3_path, bitrate="256k"):
         return wav_path
 
 
+def resolve_uploaded_file_path(file_input):
+    """Resolve the filesystem path from a Gradio file input."""
+    if not file_input:
+        return None
+
+    if isinstance(file_input, str):
+        return file_input
+
+    if isinstance(file_input, dict):
+        return file_input.get("name") or file_input.get("path")
+
+    return getattr(file_input, "name", None)
+
+
 def format_timecode(milliseconds):
     """Format milliseconds into HH:MM:SS or MM:SS."""
     try:
@@ -274,23 +293,48 @@ def build_segments_preview_data(text, max_tokens, log_prefix="Segmentation previ
 
     try:
         start_time = time.perf_counter()
+        char_count = len(text)
+        console_log(f"[{log_prefix}] Tokenizing {char_count} characters...")
+        token_start = time.perf_counter()
         text_tokens_list = tts.tokenizer.tokenize(text)
+        token_elapsed = time.perf_counter() - token_start
+        token_count = len(text_tokens_list)
+        console_log(
+            f"[{log_prefix}] Tokenized {token_count} tokens in {token_elapsed:.2f}s; splitting into segments (max {max_tokens})."
+        )
+
+        segment_start = time.perf_counter()
         segments = tts.tokenizer.split_segments(
             text_tokens_list,
             max_text_tokens_per_segment=max_tokens,
         )
+        split_elapsed = time.perf_counter() - segment_start
+        console_log(
+            f"[{log_prefix}] Created {len(segments)} raw segments in {split_elapsed:.2f}s; assembling preview rows..."
+        )
+
         data = []
         total_tokens = 0
+        assembly_start = time.perf_counter()
+        last_log_time = None
         for i, segment_tokens in enumerate(segments):
             segment_str = ''.join(segment_tokens)
             tokens_count = len(segment_tokens)
             total_tokens += tokens_count
             data.append([i, segment_str, tokens_count])
+            last_log_time = log_segmentation_progress(
+                f"{log_prefix} assembly",
+                i + 1,
+                len(segments),
+                assembly_start,
+                last_log_time,
+                min_interval=0.5,
+            )
         elapsed = time.perf_counter() - start_time
         log_segmentation_summary(log_prefix, len(segments), total_tokens, elapsed)
         return data
     except Exception as exc:
-        print(f"Error building segments preview: {exc}")
+        console_log(f"Error building segments preview: {exc}")
         return []
 
 
@@ -394,6 +438,381 @@ def apply_chapters_to_mp3(mp3_path, text, chapters):
 
     audio.save()
     return total_duration_ms, chapter_entries
+
+
+def read_mp3_chapters(mp3_path):
+    """Read existing chapter frames from an MP3 file."""
+    if not MUTAGEN_AVAILABLE or not os.path.exists(mp3_path):
+        return []
+
+    try:
+        audio = MP3(mp3_path, ID3=ID3)
+    except Exception as exc:
+        console_log(f"Failed to inspect chapters in {mp3_path}: {exc}")
+        return []
+
+    if not audio.tags:
+        return []
+
+    chapters = []
+    for key, frame in audio.tags.items():
+        if not key.startswith("CHAP"):
+            continue
+
+        start_time = int(getattr(frame, "start_time", 0) or 0)
+        title = None
+
+        for attr in ("subframes", "sub_frames"):
+            subframes = getattr(frame, attr, None)
+            if subframes is None:
+                continue
+
+            try:
+                tit2_frames = subframes.getall("TIT2")
+            except AttributeError:
+                tit2_candidate = subframes.get("TIT2") if hasattr(subframes, "get") else None
+                tit2_frames = [tit2_candidate] if tit2_candidate else []
+
+            for tit2 in tit2_frames or []:
+                if tit2 is None:
+                    continue
+                text = getattr(tit2, "text", [])
+                if isinstance(text, (list, tuple)):
+                    title = next((str(item) for item in text if item), None)
+                elif text:
+                    title = str(text)
+                if title:
+                    break
+            if title:
+                break
+
+        if not title:
+            try:
+                for tit2 in frame.getall("TIT2"):
+                    text = getattr(tit2, "text", [])
+                    if isinstance(text, (list, tuple)):
+                        title = next((str(item) for item in text if item), None)
+                    elif text:
+                        title = str(text)
+                    if title:
+                        break
+            except Exception:
+                title = None
+
+        if not title:
+            title = os.path.splitext(os.path.basename(mp3_path))[0] or "Chapter"
+
+        chapters.append({
+            "title": title,
+            "start_ms": max(0, start_time),
+        })
+
+    return sorted(chapters, key=lambda item: item["start_ms"])
+
+
+def write_chapters_to_mp3(mp3_path, chapter_entries):
+    """Write chapter metadata to an MP3 file."""
+    if not MUTAGEN_AVAILABLE:
+        return False, "mutagen is not installed; cannot write chapters."
+    if not os.path.exists(mp3_path):
+        return False, f"MP3 file not found: {mp3_path}"
+
+    audio = MP3(mp3_path, ID3=ID3)
+    total_duration_ms = int(audio.info.length * 1000) if audio.info and audio.info.length else 0
+
+    if audio.tags is None:
+        audio.add_tags()
+    else:
+        audio.tags.delall("CHAP")
+        audio.tags.delall("CTOC")
+
+    cleaned = []
+    for entry in chapter_entries or []:
+        if entry is None:
+            continue
+        title = str(entry.get("title") or "Chapter").strip() or "Chapter"
+        start_ms = int(max(0, entry.get("start_ms", 0)))
+        cleaned.append({"title": title, "start_ms": start_ms})
+
+    if not cleaned:
+        audio.save()
+        return True, "No chapters to write."
+
+    cleaned.sort(key=lambda item: item["start_ms"])
+
+    if total_duration_ms <= 0 and cleaned:
+        total_duration_ms = cleaned[-1]["start_ms"]
+
+    element_ids = []
+    for idx, chapter in enumerate(cleaned):
+        element_id = f"chp{idx:04d}"
+        start_ms = chapter["start_ms"]
+        if idx + 1 < len(cleaned):
+            end_ms = max(start_ms, cleaned[idx + 1]["start_ms"])
+        else:
+            end_ms = max(start_ms, total_duration_ms)
+
+        chap_frame = CHAP(
+            element_id=element_id,
+            start_time=start_ms,
+            end_time=end_ms,
+            start_offset=0,
+            end_offset=0,
+            sub_frames=[TIT2(encoding=3, text=chapter["title"])],
+        )
+        audio.tags.add(chap_frame)
+        element_ids.append(element_id)
+
+    if element_ids:
+        toc = CTOC(
+            element_id="toc",
+            flags=0,
+            child_element_ids=element_ids,
+        )
+        toc.add(TIT2(encoding=3, text="Chapters"))
+        audio.tags.add(toc)
+
+    audio.save()
+    return True, f"Wrote {len(element_ids)} chapter marker(s)."
+
+
+def merge_mp3_files(mp3_files, keep_existing_chapters=True, output_filename="", mp3_bitrate_value="256k"):
+    """Merge multiple MP3 files into a single MP3 and manage chapter metadata."""
+    if not MP3_AVAILABLE:
+        return (
+            gr.update(value="MP3 merging requires pydub. Install pydub to enable this feature.", visible=True),
+            gr.update(value=None, visible=False),
+        )
+
+    file_paths = []
+    if isinstance(mp3_files, list):
+        for item in mp3_files:
+            if isinstance(item, str) and item:
+                file_paths.append(item)
+            elif isinstance(item, dict):
+                path = item.get("name") or item.get("path")
+                if path:
+                    file_paths.append(path)
+    elif isinstance(mp3_files, str) and mp3_files:
+        file_paths.append(mp3_files)
+
+    file_paths = [path for path in file_paths if path and os.path.exists(path)]
+
+    if len(file_paths) < 2:
+        return (
+            gr.update(value="Please select at least two MP3 files to merge.", visible=True),
+            gr.update(value=None, visible=False),
+        )
+
+    bitrate = str(mp3_bitrate_value or "256k")
+    if not bitrate.endswith("k"):
+        bitrate = f"{bitrate}k"
+
+    combined_audio = None
+    chapter_entries = []
+    offset_ms = 0
+    unable_to_keep = False
+
+    for idx, path in enumerate(file_paths):
+        try:
+            segment = AudioSegment.from_file(path)
+        except Exception as exc:
+            return (
+                gr.update(
+                    value=f"Failed to load MP3 '{os.path.basename(path)}': {exc}",
+                    visible=True,
+                ),
+                gr.update(value=None, visible=False),
+            )
+
+        if combined_audio is None:
+            combined_audio = segment
+        else:
+            combined_audio += segment
+
+        base_title = os.path.splitext(os.path.basename(path))[0] or f"Track {idx + 1}"
+        chapter_entries.append({
+            "title": base_title,
+            "start_ms": offset_ms,
+        })
+
+        if keep_existing_chapters:
+            if MUTAGEN_AVAILABLE:
+                for chapter in read_mp3_chapters(path):
+                    chapter_entries.append({
+                        "title": chapter.get("title") or base_title,
+                        "start_ms": offset_ms + int(chapter.get("start_ms", 0)),
+                    })
+            else:
+                unable_to_keep = True
+
+        offset_ms += len(segment)
+
+    if combined_audio is None:
+        return (
+            gr.update(value="No audio data could be read from the selected files.", visible=True),
+            gr.update(value=None, visible=False),
+        )
+
+    output_path = generate_output_path(
+        filename=output_filename.strip() or None,
+        save_as_mp3=True,
+        prefix="merged_",
+    )
+
+    try:
+        combined_audio.export(output_path, format="mp3", bitrate=bitrate)
+    except Exception as exc:
+        return (
+            gr.update(value=f"Failed to export merged MP3: {exc}", visible=True),
+            gr.update(value=None, visible=False),
+        )
+
+    messages = [
+        f"Merged {len(file_paths)} MP3 file(s) into {os.path.relpath(output_path)}.",
+    ]
+
+    if chapter_entries:
+        if MUTAGEN_AVAILABLE:
+            success, chapter_msg = write_chapters_to_mp3(output_path, chapter_entries)
+            messages.append(chapter_msg)
+        else:
+            messages.append("mutagen is not installed; chapter markers were not written.")
+
+    if unable_to_keep:
+        messages.append("Existing chapters could not be preserved because mutagen is missing.")
+
+    return (
+        gr.update(value="\n".join(messages), visible=True),
+        gr.update(value=output_path, visible=True),
+    )
+
+
+def load_mp3_chapter_data(mp3_file):
+    """Load chapter metadata from an MP3 for editing."""
+    resolved_path = resolve_uploaded_file_path(mp3_file)
+
+    if not resolved_path:
+        return (
+            gr.update(value=[], visible=False),
+            gr.update(value="Select an MP3 file to inspect its chapters.", visible=True),
+            {"path": "", "chapters": []},
+            gr.update(interactive=False),
+        )
+
+    if not os.path.exists(resolved_path):
+        return (
+            gr.update(value=[], visible=False),
+            gr.update(value=f"File not found: {resolved_path}", visible=True),
+            {"path": "", "chapters": []},
+            gr.update(interactive=False),
+        )
+
+    if not MUTAGEN_AVAILABLE:
+        return (
+            gr.update(value=[], visible=False),
+            gr.update(value="mutagen is required to read MP3 chapters.", visible=True),
+            {"path": "", "chapters": []},
+            gr.update(interactive=False),
+        )
+
+    chapters = read_mp3_chapters(resolved_path)
+    filename = os.path.basename(resolved_path)
+
+    if not chapters:
+        return (
+            gr.update(value=[], visible=False),
+            gr.update(value=f"No chapters were found in {filename}.", visible=True),
+            {"path": resolved_path, "chapters": []},
+            gr.update(interactive=False),
+        )
+
+    table_rows = [[chapter.get("title", ""), format_timecode(chapter.get("start_ms", 0))] for chapter in chapters]
+    status_message = f"Loaded {len(chapters)} chapter(s) from {filename}. Edit the Title column and click Save."
+
+    return (
+        gr.update(value=table_rows, visible=True),
+        gr.update(value=status_message, visible=True),
+        {"path": resolved_path, "chapters": chapters},
+        gr.update(interactive=True),
+    )
+
+
+def save_mp3_chapter_titles(table_rows, editor_state):
+    """Persist edited chapter titles back into the MP3 file."""
+    state = editor_state or {}
+    resolved_path = state.get("path")
+    original_chapters = state.get("chapters") or []
+
+    if not resolved_path:
+        return (
+            gr.update(value="Load an MP3 file with chapters before saving.", visible=True),
+            {"path": "", "chapters": []},
+            gr.update(value=[], visible=False),
+        )
+
+    if not os.path.exists(resolved_path):
+        return (
+            gr.update(value=f"File no longer exists: {resolved_path}", visible=True),
+            {"path": "", "chapters": []},
+            gr.update(value=[], visible=False),
+        )
+
+    if not MUTAGEN_AVAILABLE:
+        return (
+            gr.update(value="mutagen is required to write MP3 chapters.", visible=True),
+            {"path": resolved_path, "chapters": original_chapters},
+            gr.update(value=table_rows or [], visible=bool(table_rows)),
+        )
+
+    if not original_chapters:
+        return (
+            gr.update(value="No chapters are available to edit for this file.", visible=True),
+            {"path": resolved_path, "chapters": []},
+            gr.update(value=[], visible=False),
+        )
+
+    titles = []
+    table_rows = table_rows or []
+    for idx, chapter in enumerate(original_chapters):
+        base_title = chapter.get("title") or f"Chapter {idx + 1}"
+        new_title = base_title
+        if idx < len(table_rows):
+            row = table_rows[idx]
+            if isinstance(row, (list, tuple)) and row:
+                candidate = row[0]
+            elif isinstance(row, dict):
+                candidate = row.get("Title") or row.get(0)
+            else:
+                candidate = None
+            if candidate is not None:
+                candidate_str = str(candidate).strip()
+                if candidate_str:
+                    new_title = candidate_str
+        titles.append({"title": new_title, "start_ms": int(chapter.get("start_ms", 0))})
+
+    success, message = write_chapters_to_mp3(resolved_path, titles)
+
+    if success:
+        updated_chapters = []
+        for idx, chapter in enumerate(original_chapters):
+            updated = {
+                "title": titles[idx]["title"],
+                "start_ms": int(chapter.get("start_ms", 0)),
+            }
+            updated_chapters.append(updated)
+        updated_table = [[entry["title"], format_timecode(entry.get("start_ms", 0))] for entry in updated_chapters]
+        return (
+            gr.update(value=f"{message} ({os.path.basename(resolved_path)})", visible=True),
+            {"path": resolved_path, "chapters": updated_chapters},
+            gr.update(value=updated_table, visible=True),
+        )
+
+    return (
+        gr.update(value=message, visible=True),
+        {"path": resolved_path, "chapters": original_chapters},
+        gr.update(value=table_rows, visible=bool(table_rows)),
+    )
 
 
 def compute_chapter_preview_data(enable_chapters, text, regex_pattern):
@@ -779,7 +1198,7 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
 
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
-    return update_button
+    return update_button, update_button
 
 
 theme = gr.themes.Soft()
@@ -841,7 +1260,9 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                     info=f"Model v{tts.model_version or '1.0'} | Supports multiple languages. Long texts will be automatically segmented."
                 )
                 with gr.Row():
-                    gen_button = gr.Button("Generate Speech", key="gen_button", interactive=True, variant="primary")
+                    process_segments_button = gr.Button("Process Segments", variant="secondary")
+                    process_and_generate_button = gr.Button("Process & Generate Audio", variant="primary")
+                    generate_from_processed_button = gr.Button("Generate from Processed", variant="secondary")
                     open_outputs_button = gr.Button("📁 Open Outputs Folder", key="open_outputs_button")
 
                 # Output filename and save used audio options
@@ -1067,6 +1488,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 wrap=True,
                 interactive=False,
             )
+            processed_segments_state = gr.State(value=None)
 
         with gr.Accordion("Chapter Settings", open=False):
             enable_chapters = gr.Checkbox(
@@ -1275,6 +1697,62 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
         chapters_state = gr.State([])
 
+    with gr.Tab("Extras"):
+        gr.Markdown("### 🔧 Extras")
+        with gr.Group():
+            gr.Markdown("#### Merge MP3 Files")
+            merge_mp3_inputs = gr.Files(
+                label="MP3 Files",
+                file_types=[".mp3"],
+                file_count="multiple",
+                type="filepath",
+                info="Select the MP3 files to merge in playback order.",
+            )
+            merge_keep_chapters = gr.Checkbox(
+                label="Keep chapters",
+                value=True,
+                info=(
+                    "When enabled, existing chapter markers are preserved and new markers are added at the start of each source MP3."
+                    " Disable to replace all chapters with new ones at each MP3 boundary."
+                ),
+            )
+            merge_output_name = gr.Textbox(
+                label="Merged Output Filename (optional)",
+                placeholder="Leave empty for auto-numbered merged_XXXX.mp3",
+            )
+            merge_button = gr.Button("Merge MP3s", variant="primary")
+            merge_status = gr.Markdown(value="", visible=False)
+            merged_audio_preview = gr.Audio(
+                label="Merged MP3 Preview",
+                type="filepath",
+                interactive=False,
+                visible=False,
+            )
+
+        with gr.Group():
+            gr.Markdown("#### MP3 Chapter Editor")
+            gr.Markdown("Load an MP3 to review its embedded chapters and rename them before saving.")
+            with gr.Row():
+                chapter_editor_file = gr.File(
+                    label="MP3 File",
+                    file_types=[".mp3"],
+                    type="filepath",
+                )
+                chapter_load_button = gr.Button("Load Chapters")
+            chapter_editor_table = gr.Dataframe(
+                headers=["Title", "Start (mm:ss)"],
+                datatype=["str", "str"],
+                type="array",
+                interactive=True,
+                visible=False,
+                row_count=(0, "dynamic"),
+                col_count=(2, "fixed"),
+            )
+            chapter_editor_status = gr.Markdown(value="", visible=False)
+            chapter_save_button = gr.Button("Save Chapter Titles", variant="primary", interactive=False)
+
+        chapter_editor_state = gr.State({"path": "", "chapters": []})
+
     def process_media_upload(media_file, time_ranges):
         """Process uploaded media file and extract audio."""
         if media_file is None:
@@ -1384,6 +1862,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 gr.update(value="", visible=False),
                 [],
                 gr.update(value="", visible=False),
+                None,
             )
             return
 
@@ -1397,12 +1876,17 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 gr.update(value="", visible=False),
                 [],
                 gr.update(value="", visible=False),
+                None,
             )
             return
 
         try:
             progress(0.0, desc="Reading text file")
-            if TEXT_FILE_SIZE_LIMIT and os.path.getsize(file_path) > TEXT_FILE_SIZE_LIMIT:
+            file_size = os.path.getsize(file_path)
+            console_log(
+                f"[Text loader] Reading {os.path.basename(file_path)} ({file_size / 1024:.1f} KiB)..."
+            )
+            if TEXT_FILE_SIZE_LIMIT and file_size > TEXT_FILE_SIZE_LIMIT:
                 file_status = gr.update(
                     value=f"⚠️ Text file is larger than {TEXT_FILE_SIZE_LIMIT // (1024 * 1024)} MB. Please use a smaller file.",
                     visible=True,
@@ -1415,14 +1899,18 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                     gr.update(value="", visible=False),
                     [],
                     gr.update(value="", visible=False),
+                    None,
                 )
                 return
 
             content = None
+            encoding_used = None
+            read_start = time.perf_counter()
             for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
                 try:
                     with open(file_path, "r", encoding=encoding) as handle:
                         content = handle.read()
+                    encoding_used = encoding
                     break
                 except UnicodeDecodeError:
                     continue
@@ -1430,8 +1918,13 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             if content is None:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
                     content = handle.read()
+                encoding_used = "utf-8 (errors ignored)"
 
-            max_tokens = parse_max_tokens(max_text_tokens_per_segment)
+            read_elapsed = time.perf_counter() - read_start
+            console_log(
+                f"[Text loader] Loaded {len(content)} characters using {encoding_used} in {read_elapsed:.2f}s"
+            )
+
             chapter_matches, chapter_error_msg, chapter_rows, table_visible = compute_chapter_preview_data(
                 enable_chapters,
                 content,
@@ -1454,95 +1947,17 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 visible=True,
             )
 
-            if preview_mode == "Experimental (progressive)":
-                progress(0.1, desc="Tokenizing text")
-                overall_start = time.perf_counter()
-                tokenized = tts.tokenizer.tokenize(content)
-                progress(0.25, desc="Splitting into segments")
-                segments = tts.tokenizer.split_segments(
-                    tokenized,
-                    max_text_tokens_per_segment=max_tokens,
-                )
-                total_segments = len(segments)
-                total_tokens = sum(len(seg) for seg in segments)
-                prep_elapsed = time.perf_counter() - overall_start
-                print(
-                    f"[Segmentation preview (experimental/file)] Prepared {total_segments} segments "
-                    f"({total_tokens} tokens) in {prep_elapsed:.2f}s. Streaming updates..."
-                )
-
-                preview_rows = []
-                stream_start = time.perf_counter()
-                last_log_time = None
-
-                yield (
-                    gr.update(value=content),
-                    gr.update(value=[], visible=True, type="array"),
-                    file_status,
-                    chapter_table_update,
-                    chapter_error_update,
-                    chapter_matches,
-                    gr.update(value="", visible=False),
-                )
-
-                if total_segments == 0:
-                    progress(1.0, desc="No segments found")
-                    log_segmentation_summary(
-                        "Segmentation preview (experimental/file)",
-                        total_segments,
-                        total_tokens,
-                        time.perf_counter() - overall_start,
-                    )
-                    return
-
-                for idx, segment_tokens in enumerate(segments):
-                    segment_str = ''.join(segment_tokens)
-                    tokens_count = len(segment_tokens)
-                    preview_rows.append([idx, segment_str, tokens_count])
-                    progress(0.25 + 0.7 * ((idx + 1) / total_segments), desc=f"Building preview ({idx + 1}/{total_segments})")
-                    last_log_time = log_segmentation_progress(
-                        "Segmentation preview (experimental/file)",
-                        idx + 1,
-                        total_segments,
-                        stream_start,
-                        last_log_time,
-                    )
-                    yield (
-                        gr.update(),
-                        gr.update(value=list(preview_rows), visible=True, type="array"),
-                        gr.update(),
-                        gr.update(),
-                        gr.update(),
-                        chapter_matches,
-                        gr.update(value="", visible=False),
-                    )
-
-                progress(1.0, desc="Preview ready")
-                log_segmentation_summary(
-                    "Segmentation preview (experimental/file)",
-                    total_segments,
-                    total_tokens,
-                    time.perf_counter() - overall_start,
-                )
-                return
-
-            segments_data = build_segments_preview_data(
-                content,
-                max_tokens,
-                log_prefix="Segmentation preview (standard/file)",
-            )
-            segments_update = gr.update(value=segments_data, visible=True, type="array")
-
-            progress(1.0, desc="Preview ready")
+            progress(1.0, desc="File loaded")
 
             yield (
                 gr.update(value=content),
-                segments_update,
+                gr.update(value=[], visible=True, type="array"),
                 file_status,
                 chapter_table_update,
                 chapter_error_update,
                 chapter_matches,
                 gr.update(value="", visible=False),
+                None,
             )
             return
         except Exception as exc:
@@ -1554,6 +1969,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 gr.update(value="", visible=False),
                 [],
                 gr.update(value="", visible=False),
+                None,
             )
             return
 
@@ -1580,11 +1996,13 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
         return table_update, error_update, matches, status_update
 
-    def on_input_text_change(text, max_text_tokens_per_segment, preview_mode, progress=gr.Progress(track_tqdm=True)):
+    def process_segments(text, max_text_tokens_per_segment, preview_mode,
+                         progress=gr.Progress(track_tqdm=True)):
         sanitized_text = text or ""
         if not sanitized_text.strip():
             yield {
                 segments_preview: gr.update(value=[], visible=True),
+                processed_segments_state: None,
             }
             return
 
@@ -1594,23 +2012,37 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             try:
                 overall_start = time.perf_counter()
                 progress(0.0, desc="Tokenizing text")
+                console_log(
+                    f"[Segmentation preview (experimental/input)] Tokenizing {len(sanitized_text)} characters..."
+                )
+                token_start = time.perf_counter()
                 text_tokens_list = tts.tokenizer.tokenize(sanitized_text)
+                token_elapsed = time.perf_counter() - token_start
+                console_log(
+                    f"[Segmentation preview (experimental/input)] Tokenized {len(text_tokens_list)} tokens in {token_elapsed:.2f}s"
+                )
                 progress(0.2, desc="Splitting into segments")
+                console_log(
+                    f"[Segmentation preview (experimental/input)] Splitting tokens into segments (max {max_tokens})..."
+                )
                 segments = tts.tokenizer.split_segments(
                     text_tokens_list,
                     max_text_tokens_per_segment=max_tokens,
                 )
                 total_tokens = sum(len(segment_tokens) for segment_tokens in segments)
+                console_log(
+                    f"[Segmentation preview (experimental/input)] Prepared {len(segments)} segments; streaming incremental updates."
+                )
                 prep_elapsed = time.perf_counter() - overall_start
-                print(
-                    f"[Segmentation preview (experimental)] Prepared {len(segments)} segments "
-                    f"({total_tokens} tokens) in {prep_elapsed:.2f}s. Streaming updates..."
+                console_log(
+                    f"[Segmentation preview (experimental/input)] Total preparation time {prep_elapsed:.2f}s ({total_tokens} tokens)."
                 )
             except Exception as exc:
                 progress(1.0, desc="Failed to build preview")
-                print(f"Error during experimental preview: {exc}")
+                console_log(f"Error during experimental preview: {exc}")
                 yield {
                     segments_preview: gr.update(value=[], visible=True),
+                    processed_segments_state: None,
                 }
                 return
 
@@ -1619,6 +2051,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 progress(1.0, desc="No segments found")
                 yield {
                     segments_preview: gr.update(value=[], visible=True),
+                    processed_segments_state: None,
                 }
                 return
 
@@ -1648,15 +2081,170 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 total_tokens,
                 time.perf_counter() - overall_start,
             )
+
+            yield {
+                processed_segments_state: {
+                    "text": sanitized_text,
+                    "max_tokens": max_tokens,
+                    "segments": list(preview_rows),
+                    "mode": preview_mode,
+                    "processed_at": time.perf_counter(),
+                }
+            }
         else:
+            console_log(
+                f"[Segmentation preview (standard/input)] Preparing preview with max {max_tokens} tokens per segment..."
+            )
             data = build_segments_preview_data(
                 sanitized_text,
                 max_tokens,
                 log_prefix="Segmentation preview (standard)",
             )
+            state_value = None
+            if data:
+                state_value = {
+                    "text": sanitized_text,
+                    "max_tokens": max_tokens,
+                    "segments": list(data),
+                    "mode": preview_mode,
+                    "processed_at": time.perf_counter(),
+                }
+
             yield {
                 segments_preview: gr.update(value=data, visible=True, type="array"),
+                processed_segments_state: state_value,
             }
+
+    def invalidate_processed_segments(*_):
+        """Clear stored segments when text or settings change."""
+        return gr.update(value=[], visible=True, type="array"), None
+
+    def generate_from_processed(
+        segments_state,
+        emo_control_method,
+        prompt,
+        text,
+        save_used_audio,
+        output_filename,
+        emo_ref_path,
+        emo_weight,
+        vec1,
+        vec2,
+        vec3,
+        vec4,
+        vec5,
+        vec6,
+        vec7,
+        vec8,
+        emo_text,
+        emo_random,
+        max_text_tokens_per_segment,
+        enable_chapters,
+        chapters_state,
+        save_as_mp3,
+        diffusion_steps,
+        inference_cfg_rate,
+        interval_silence,
+        max_speaker_audio_length,
+        max_emotion_audio_length,
+        autoregressive_batch_size,
+        apply_emo_bias,
+        max_emotion_sum,
+        latent_multiplier,
+        max_consecutive_silence,
+        mp3_bitrate,
+        do_sample,
+        top_p,
+        top_k,
+        temperature,
+        length_penalty,
+        num_beams,
+        repetition_penalty,
+        max_mel_tokens,
+        low_memory_mode,
+        prevent_vram_accumulation,
+        semantic_layer,
+        cfm_cache_length,
+        emo_bias_joy,
+        emo_bias_anger,
+        emo_bias_sad,
+        emo_bias_fear,
+        emo_bias_disgust,
+        emo_bias_depression,
+        emo_bias_surprise,
+        emo_bias_calm,
+        progress=gr.Progress(),
+    ):
+        sanitized_text = text or ""
+        if not sanitized_text.strip():
+            raise gr.Error("Please enter text and process segments before generating audio.")
+
+        max_tokens = parse_max_tokens(max_text_tokens_per_segment)
+
+        if not segments_state or not isinstance(segments_state, dict):
+            raise gr.Error("Please process segments before generating audio.")
+
+        if (
+            segments_state.get("text") != sanitized_text
+            or segments_state.get("max_tokens") != max_tokens
+        ):
+            raise gr.Error("Text or segmentation settings have changed. Process segments again before generating.")
+
+        return gen_single(
+            emo_control_method,
+            prompt,
+            text,
+            save_used_audio,
+            output_filename,
+            emo_ref_path,
+            emo_weight,
+            vec1,
+            vec2,
+            vec3,
+            vec4,
+            vec5,
+            vec6,
+            vec7,
+            vec8,
+            emo_text,
+            emo_random,
+            max_text_tokens_per_segment,
+            enable_chapters,
+            chapters_state,
+            save_as_mp3,
+            diffusion_steps,
+            inference_cfg_rate,
+            interval_silence,
+            max_speaker_audio_length,
+            max_emotion_audio_length,
+            autoregressive_batch_size,
+            apply_emo_bias,
+            max_emotion_sum,
+            latent_multiplier,
+            max_consecutive_silence,
+            mp3_bitrate,
+            do_sample,
+            top_p,
+            top_k,
+            temperature,
+            length_penalty,
+            num_beams,
+            repetition_penalty,
+            max_mel_tokens,
+            low_memory_mode,
+            prevent_vram_accumulation,
+            semantic_layer,
+            cfm_cache_length,
+            emo_bias_joy,
+            emo_bias_anger,
+            emo_bias_sad,
+            emo_bias_fear,
+            emo_bias_disgust,
+            emo_bias_depression,
+            emo_bias_surprise,
+            emo_bias_calm,
+            progress=progress,
+        )
 
     def on_method_change(emo_control_method):
         if emo_control_method == 1:  # emotion reference audio
@@ -1699,27 +2287,27 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
 
     input_text_single.change(
-        on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_segment, segments_preview_mode],
-        outputs=[segments_preview]
+        invalidate_processed_segments,
+        inputs=[],
+        outputs=[segments_preview, processed_segments_state]
     )
 
     max_text_tokens_per_segment.change(
-        on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_segment, segments_preview_mode],
-        outputs=[segments_preview]
+        invalidate_processed_segments,
+        inputs=[],
+        outputs=[segments_preview, processed_segments_state]
     )
 
     segments_preview_mode.change(
-        on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_segment, segments_preview_mode],
-        outputs=[segments_preview]
+        invalidate_processed_segments,
+        inputs=[],
+        outputs=[segments_preview, processed_segments_state]
     )
 
     text_file_upload.change(
         load_text_file_contents,
         inputs=[text_file_upload, max_text_tokens_per_segment, segments_preview_mode, enable_chapters, chapter_regex_input],
-        outputs=[input_text_single, segments_preview, text_file_status, chapter_preview, chapter_error, chapters_state, chapter_status]
+        outputs=[input_text_single, segments_preview, text_file_status, chapter_preview, chapter_error, chapters_state, chapter_status, processed_segments_state]
     )
 
     enable_chapters.change(
@@ -1742,7 +2330,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
     prompt_audio.upload(update_prompt_audio,
                          inputs=[],
-                         outputs=[gen_button])
+                         outputs=[process_and_generate_button, generate_from_processed_button])
 
     # New UI callbacks
     media_upload.change(
@@ -1768,19 +2356,95 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
         outputs=[media_upload_group, prompt_audio, load_status]
     )
 
-    gen_button.click(gen_single,
-                     inputs=[emo_control_method,prompt_audio, input_text_single, save_used_audio, output_filename, emo_upload, emo_weight,
-                            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
-                             emo_text,emo_random,
-                             max_text_tokens_per_segment,
-                             enable_chapters,
-                             chapters_state,
-                             save_as_mp3,
-                             *expert_params,
-                             *advanced_params,
-                             *model_params,
-                     ],
-                     outputs=[output_audio, chapter_status, chapter_preview, chapters_state])
+    process_segments_button.click(
+        process_segments,
+        inputs=[input_text_single, max_text_tokens_per_segment, segments_preview_mode],
+        outputs=[segments_preview, processed_segments_state],
+    )
+
+    process_and_generate_button.click(
+        process_segments,
+        inputs=[input_text_single, max_text_tokens_per_segment, segments_preview_mode],
+        outputs=[segments_preview, processed_segments_state],
+    ).then(
+        generate_from_processed,
+        inputs=[processed_segments_state,
+                emo_control_method,
+                prompt_audio,
+                input_text_single,
+                save_used_audio,
+                output_filename,
+                emo_upload,
+                emo_weight,
+                vec1,
+                vec2,
+                vec3,
+                vec4,
+                vec5,
+                vec6,
+                vec7,
+                vec8,
+                emo_text,
+                emo_random,
+                max_text_tokens_per_segment,
+                enable_chapters,
+                chapters_state,
+                save_as_mp3,
+                *expert_params,
+                *advanced_params,
+                *model_params,
+        ],
+        outputs=[output_audio, chapter_status, chapter_preview, chapters_state],
+    )
+
+    generate_from_processed_button.click(
+        generate_from_processed,
+        inputs=[processed_segments_state,
+                emo_control_method,
+                prompt_audio,
+                input_text_single,
+                save_used_audio,
+                output_filename,
+                emo_upload,
+                emo_weight,
+                vec1,
+                vec2,
+                vec3,
+                vec4,
+                vec5,
+                vec6,
+                vec7,
+                vec8,
+                emo_text,
+                emo_random,
+                max_text_tokens_per_segment,
+                enable_chapters,
+                chapters_state,
+                save_as_mp3,
+                *expert_params,
+                *advanced_params,
+                *model_params,
+        ],
+        outputs=[output_audio, chapter_status, chapter_preview, chapters_state],
+    )
+
+    chapter_load_button.click(
+        load_mp3_chapter_data,
+        inputs=[chapter_editor_file],
+        outputs=[chapter_editor_table, chapter_editor_status, chapter_editor_state, chapter_save_button],
+    )
+
+    chapter_save_button.click(
+        save_mp3_chapter_titles,
+        inputs=[chapter_editor_table, chapter_editor_state],
+        outputs=[chapter_editor_status, chapter_editor_state, chapter_editor_table],
+    )
+
+    merge_button.click(
+        merge_mp3_files,
+        inputs=[merge_mp3_inputs, merge_keep_chapters, merge_output_name, mp3_bitrate],
+        outputs=[merge_status, merged_audio_preview],
+    )
 
     open_outputs_button.click(open_outputs_folder)
 
