@@ -1,4 +1,5 @@
 import html
+import importlib.util
 import json
 import os
 import sys
@@ -62,6 +63,10 @@ for file in [
 import gradio as gr
 from indextts.infer_v2 import IndexTTS2
 from tools.i18n.i18n import I18nAuto
+from tools.vocal_isolation import (
+    VocalIsolationError,
+    isolate_vocals_with_demucs,
+)
 
 i18n = I18nAuto(language="Auto")
 MODE = 'local'
@@ -145,6 +150,14 @@ try:
 except ImportError:
     MUTAGEN_AVAILABLE = False
     print("Warning: mutagen not installed. MP3 chapter metadata will not be added.")
+
+
+DEMUCS_AVAILABLE = importlib.util.find_spec("demucs") is not None
+if not DEMUCS_AVAILABLE:
+    print(
+        "Warning: demucs not installed. Vocal isolation will be disabled until you run "
+        "`pip install demucs`."
+    )
 
 # Check if FFmpeg is available
 def check_ffmpeg():
@@ -685,6 +698,129 @@ def merge_mp3_files(mp3_files, keep_existing_chapters=True, output_filename="", 
     return (
         gr.update(value="\n".join(messages), visible=True),
         gr.update(value=output_path, visible=True),
+    )
+
+
+def isolate_vocals_ui(
+    audio_file,
+    model_name,
+    device_choice,
+    segment_length,
+    shifts,
+    overlap,
+    export_mp3,
+    mp3_bitrate_value,
+    progress=gr.Progress(track_tqdm=False),
+):
+    """Gradio callback to isolate vocals via Demucs."""
+
+    if not DEMUCS_AVAILABLE:
+        return (
+            gr.update(
+                value="Demucs is not installed. Install it with `pip install demucs` to enable vocal isolation.",
+                visible=True,
+            ),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value="", visible=False),
+        )
+
+    resolved_path = resolve_uploaded_file_path(audio_file)
+
+    if not resolved_path:
+        return (
+            gr.update(value="Please upload an audio file to process.", visible=True),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value="", visible=False),
+        )
+
+    if not os.path.exists(resolved_path):
+        return (
+            gr.update(value=f"File not found: {resolved_path}", visible=True),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value="", visible=False),
+        )
+
+    device = None if device_choice in (None, "", "Auto") else device_choice
+    segment = segment_length if segment_length and segment_length > 0 else None
+    shifts_value = int(shifts) if shifts and shifts > 0 else None
+    overlap_value = overlap if overlap is not None else None
+
+    try:
+        progress(0.0, desc="Starting Demucs")
+        result = isolate_vocals_with_demucs(
+            resolved_path,
+            model_name=model_name,
+            device=device,
+            segment_length=segment,
+            shifts=shifts_value,
+            overlap=overlap_value,
+        )
+    except ModuleNotFoundError as exc:
+        return (
+            gr.update(value=str(exc), visible=True),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value="", visible=False),
+        )
+    except (VocalIsolationError, FileNotFoundError) as exc:
+        return (
+            gr.update(value=str(exc), visible=True),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value="", visible=False),
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        return (
+            gr.update(value=f"Unexpected error: {exc}", visible=True),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value="", visible=False),
+        )
+
+    progress(0.6, desc="Finalizing stems")
+
+    mp3_requested = bool(export_mp3)
+    bitrate = str(mp3_bitrate_value or "256k")
+    if mp3_requested and not bitrate.endswith("k"):
+        bitrate = f"{bitrate}k"
+
+    vocals_output_path = None
+    instrumental_output_path = None
+    messages = ["✅ Vocal isolation complete."]
+
+    try:
+        if mp3_requested and MP3_AVAILABLE:
+            vocals_output_path = generate_output_path(prefix="vocals_", save_as_mp3=True)
+            convert_wav_to_mp3(result.vocals_path, vocals_output_path, bitrate=bitrate)
+        else:
+            if mp3_requested and not MP3_AVAILABLE:
+                messages.append("⚠️ pydub is not installed; saved vocals as WAV instead of MP3.")
+            vocals_output_path = generate_output_path(prefix="vocals_", save_as_mp3=False)
+            shutil.move(result.vocals_path, vocals_output_path)
+
+        if result.accompaniment_path and os.path.exists(result.accompaniment_path):
+            instrumental_output_path = generate_output_path(prefix="instrumental_", save_as_mp3=False)
+            shutil.move(result.accompaniment_path, instrumental_output_path)
+            messages.append(
+                f"Instrumental stem saved to `{os.path.relpath(instrumental_output_path)}`."
+            )
+
+        messages.append(f"Vocals saved to `{os.path.relpath(vocals_output_path)}`.")
+    finally:
+        shutil.rmtree(result.workspace_dir, ignore_errors=True)
+
+    progress(1.0, desc="Done")
+
+    logs_visible = bool(result.logs.strip())
+
+    return (
+        gr.update(value="\n".join(messages), visible=True),
+        gr.update(value=vocals_output_path, visible=bool(vocals_output_path)),
+        gr.update(value=instrumental_output_path, visible=bool(instrumental_output_path)),
+        gr.update(value=result.logs, visible=logs_visible),
     )
 
 
@@ -1700,13 +1836,114 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
     with gr.Tab("Extras"):
         gr.Markdown("### 🔧 Extras")
         with gr.Group():
+            gr.Markdown("#### Isolate Vocals (Deep Extract)")
+            gr.Markdown(
+                "Upload a mixed track to extract vocals and instrumentals using the "
+                "same Demucs two-stem workflow leveraged by the ComfyUI DeepExtract V2 "
+                "pipeline."
+            )
+            if not DEMUCS_AVAILABLE:
+                gr.Markdown(
+                    "⚠️ `demucs` is not installed in this environment. Install it with ``pip install demucs`` "
+                    "or `uv sync --extra vocal_isolation` to enable this tool.",
+                    elem_classes=["warning-text"],
+                )
+            with gr.Row():
+                vocal_isolation_file = gr.File(
+                    label="Audio File",
+                    file_types=[".wav", ".mp3", ".flac", ".ogg", ".m4a"],
+                    type="filepath",
+                )
+                with gr.Column():
+                    vocal_isolation_model = gr.Dropdown(
+                        label="Demucs Model",
+                        choices=[
+                            "htdemucs",
+                            "htdemucs_ft",
+                            "htdemucs_6s",
+                            "mdx",
+                            "mdx_q",
+                            "mdx_extra",
+                            "mdx_extra_q",
+                        ],
+                        value="htdemucs",
+                        info="Select the pre-trained Demucs model to run.",
+                    )
+                    vocal_isolation_device = gr.Radio(
+                        label="Device",
+                        choices=["Auto", "cuda", "cpu"],
+                        value="Auto",
+                        info="Choose the compute device for Demucs. Auto lets the library decide.",
+                    )
+            with gr.Row():
+                vocal_isolation_segment = gr.Slider(
+                    label="Segment Length (seconds)",
+                    minimum=0,
+                    maximum=60,
+                    step=1,
+                    value=0,
+                    info="Optional chunk size passed to Demucs --segment. Use 0 to keep default.",
+                )
+                vocal_isolation_shifts = gr.Slider(
+                    label="Shifts",
+                    minimum=0,
+                    maximum=10,
+                    step=1,
+                    value=1,
+                    info="Number of prediction shifts to average. Higher = better quality, slower.",
+                )
+                vocal_isolation_overlap = gr.Slider(
+                    label="Overlap",
+                    minimum=0.0,
+                    maximum=0.99,
+                    step=0.01,
+                    value=0.25,
+                    info="Overlap ratio between segments. Matches Demucs --overlap.",
+                )
+            with gr.Row():
+                vocal_isolation_mp3 = gr.Checkbox(
+                    label="Export MP3",
+                    value=False,
+                    info="Convert extracted vocals to MP3 (requires pydub).",
+                )
+                vocal_isolation_mp3_bitrate = gr.Dropdown(
+                    label="MP3 Bitrate",
+                    choices=["128k", "160k", "192k", "256k", "320k"],
+                    value="256k",
+                )
+                vocal_isolation_button = gr.Button(
+                    "Isolate Vocals",
+                    variant="primary",
+                    interactive=DEMUCS_AVAILABLE,
+                )
+            vocal_isolation_status = gr.Markdown(value="", visible=False)
+            with gr.Row():
+                vocal_isolation_vocals = gr.Audio(
+                    label="Extracted Vocals",
+                    type="filepath",
+                    interactive=False,
+                    visible=False,
+                )
+                vocal_isolation_instrumental = gr.Audio(
+                    label="Instrumental (No Vocals)",
+                    type="filepath",
+                    interactive=False,
+                    visible=False,
+                )
+            vocal_isolation_logs = gr.Textbox(
+                label="Demucs Log Output",
+                value="",
+                lines=6,
+                interactive=False,
+                visible=False,
+            )
+        with gr.Group():
             gr.Markdown("#### Merge MP3 Files")
             merge_mp3_inputs = gr.Files(
                 label="MP3 Files",
                 file_types=[".mp3"],
                 file_count="multiple",
                 type="filepath",
-                info="Select the MP3 files to merge in playback order.",
             )
             merge_keep_chapters = gr.Checkbox(
                 label="Keep chapters",
@@ -2440,6 +2677,26 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
         outputs=[chapter_editor_status, chapter_editor_state, chapter_editor_table],
     )
 
+    vocal_isolation_button.click(
+        isolate_vocals_ui,
+        inputs=[
+            vocal_isolation_file,
+            vocal_isolation_model,
+            vocal_isolation_device,
+            vocal_isolation_segment,
+            vocal_isolation_shifts,
+            vocal_isolation_overlap,
+            vocal_isolation_mp3,
+            vocal_isolation_mp3_bitrate,
+        ],
+        outputs=[
+            vocal_isolation_status,
+            vocal_isolation_vocals,
+            vocal_isolation_instrumental,
+            vocal_isolation_logs,
+        ],
+    )
+
     merge_button.click(
         merge_mp3_files,
         inputs=[merge_mp3_inputs, merge_keep_chapters, merge_output_name, mp3_bitrate],
@@ -2454,7 +2711,7 @@ if __name__ == "__main__":
     demo.queue(20)
     demo.launch(
         share=cmd_args.share,
-        server_name="0.0.0.0", 
-        server_port=7860
+        server_name="0.0.0.0",
+        server_port=7860,
         inbrowser=True
     )

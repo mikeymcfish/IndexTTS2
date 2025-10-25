@@ -80,6 +80,23 @@ uv run python webui.py --model_dir checkpoints
 
 By default the interface starts on <http://127.0.0.1:7860>. Run `uv run python webui.py -h` to discover flags for FP16 decoding, DeepSpeed acceleration, custom ports, and more. MP3 export is enabled automatically when the necessary encoder is available.
 
+#### Extras tab tools
+The **Extras** tab bundles utility workflows that complement the main TTS interface:
+
+- **Isolate Vocals (Deep Extract)** – mirrors the Demucs two-stem run used by ComfyUI DeepExtract V2 to split a mixed track into vocal and instrumental stems.
+- **Merge MP3 Files** – concatenate multiple MP3s and optionally keep or rewrite their chapter markers.
+- **MP3 Chapter Editor** – inspect and rename embedded chapter metadata before saving back to disk.
+
+The Extras workflows depend on optional packages that are not required for core synthesis. Install only the pieces you plan to use:
+
+| Feature | Required packages | Installation command |
+| --- | --- | --- |
+| Vocal isolation (Demucs) | `demucs`, `pydub`, `mutagen` | `pip install demucs pydub mutagen`<br/>or `uv sync --extra vocal_isolation` |
+| MP3 chapter editing | `pydub`, `mutagen` | `pip install pydub mutagen` |
+| VoiceForge OCR helpers | `deepseek-ocr` | `pip install deepseek-ocr` |
+
+If you encounter warnings about a missing module (for example `The 'demucs' package is required for vocal isolation` or `The 'deepseek-ocr' package is not installed`), install the listed packages inside the same Python environment where you run `python webui.py` or the VoiceForge tooling. Cloning the repository is sufficient—you do **not** need to fetch any additional projects beyond installing the required Python packages.
+
 ### Command line synthesis
 Use the packaged CLI to synthesize speech directly from the terminal. The command below clones the voice in `examples/voice_01.wav` and saves the result to `gen.wav` (overwriting the file when `--force` is present).
 
