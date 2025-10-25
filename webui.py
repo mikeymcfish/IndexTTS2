@@ -1,4 +1,5 @@
 import html
+import importlib.util
 import json
 import os
 import sys
@@ -149,6 +150,14 @@ try:
 except ImportError:
     MUTAGEN_AVAILABLE = False
     print("Warning: mutagen not installed. MP3 chapter metadata will not be added.")
+
+
+DEMUCS_AVAILABLE = importlib.util.find_spec("demucs") is not None
+if not DEMUCS_AVAILABLE:
+    print(
+        "Warning: demucs not installed. Vocal isolation will be disabled until you run "
+        "`pip install demucs`."
+    )
 
 # Check if FFmpeg is available
 def check_ffmpeg():
@@ -704,6 +713,17 @@ def isolate_vocals_ui(
     progress=gr.Progress(track_tqdm=False),
 ):
     """Gradio callback to isolate vocals via Demucs."""
+
+    if not DEMUCS_AVAILABLE:
+        return (
+            gr.update(
+                value="Demucs is not installed. Install it with `pip install demucs` to enable vocal isolation.",
+                visible=True,
+            ),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value="", visible=False),
+        )
 
     resolved_path = resolve_uploaded_file_path(audio_file)
 
@@ -1822,6 +1842,12 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 "same Demucs two-stem workflow leveraged by the ComfyUI DeepExtract V2 "
                 "pipeline."
             )
+            if not DEMUCS_AVAILABLE:
+                gr.Markdown(
+                    "⚠️ `demucs` is not installed in this environment. Install it with ``pip install demucs`` "
+                    "or `uv sync --extra vocal_isolation` to enable this tool.",
+                    elem_classes=["warning-text"],
+                )
             with gr.Row():
                 vocal_isolation_file = gr.File(
                     label="Audio File",
@@ -1885,7 +1911,11 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                     choices=["128k", "160k", "192k", "256k", "320k"],
                     value="256k",
                 )
-                vocal_isolation_button = gr.Button("Isolate Vocals", variant="primary")
+                vocal_isolation_button = gr.Button(
+                    "Isolate Vocals",
+                    variant="primary",
+                    interactive=DEMUCS_AVAILABLE,
+                )
             vocal_isolation_status = gr.Markdown(value="", visible=False)
             with gr.Row():
                 vocal_isolation_vocals = gr.Audio(
