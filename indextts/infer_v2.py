@@ -707,8 +707,6 @@ class IndexTTS2:
                         f"[Generation] Chapter {local_order + 1}/{active_chapter_count} "
                         f"'{chapter_title}' tokenized into {len(chapter_tokens)} tokens in {tokens_elapsed:.2f}s."
                     )
-                return
-
                     split_start = time.perf_counter()
                     split_segments = self.tokenizer.split_segments(
                         chapter_tokens,
