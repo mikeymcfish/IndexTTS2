@@ -1069,20 +1069,24 @@ def save_mp3_chapter_titles(table_rows, editor_state):
 
 def compute_chapter_preview_data(enable_chapters, text, regex_pattern):
     """Compute chapter preview matches based on a regex pattern."""
-    if not enable_chapters:
-        return [], "", [], False
 
     sanitized_text = text or ""
-    if not sanitized_text.strip():
-        return [], "Enter text to analyze for chapters.", [], True
+    sanitized_regex = (regex_pattern or "").strip()
+    feedback_enabled = bool(enable_chapters)
 
-    if not regex_pattern or not regex_pattern.strip():
-        return [], "Enter a regex to detect chapter headings.", [], True
+    if not sanitized_text.strip():
+        message = "Enter text to analyze for chapters." if feedback_enabled else ""
+        return [], message, [], feedback_enabled
+
+    if not sanitized_regex:
+        message = "Enter a regex to detect chapter headings." if feedback_enabled else ""
+        return [], message, [], feedback_enabled
 
     try:
-        pattern = re.compile(regex_pattern, flags=re.MULTILINE)
+        pattern = re.compile(sanitized_regex, flags=re.MULTILINE)
     except re.error as exc:
-        return [], f"Regex error: {exc}", [], True
+        message = f"Regex error: {exc}" if feedback_enabled else ""
+        return [], message, [], feedback_enabled
 
     matches = []
     for idx, match in enumerate(pattern.finditer(sanitized_text)):
@@ -1096,10 +1100,11 @@ def compute_chapter_preview_data(enable_chapters, text, regex_pattern):
             break
 
     if not matches:
-        return [], "No chapters matched the provided regex.", [], True
+        message = "No chapters matched the provided regex." if feedback_enabled else ""
+        return [], message, [], feedback_enabled
 
     table_rows = build_chapter_table(matches, len(sanitized_text))
-    return matches, "", table_rows, True
+    return matches, "" if feedback_enabled else "", table_rows, feedback_enabled
 
 def extract_audio_from_media(media_path, output_path=None, sample_rate=24000):
     """Extract audio from video/audio file and convert to acceptable format using FFmpeg."""
