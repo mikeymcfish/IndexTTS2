@@ -1370,16 +1370,18 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
                        reset_beam_cache_per_segment=bool(prevent_vram_accumulation),
                        **kwargs)
 
-    # Save used audio if requested
-    if save_used_audio and prompt:
-        try:
-            # Extract base filename from output path
-            base_name = os.path.basename(output).rsplit('.', 1)[0]
-            used_audio_path = os.path.join("outputs/used_audios", f"{base_name}_reference.wav")
-            shutil.copy2(prompt, used_audio_path)
-            print(f"Saved used reference audio to: {used_audio_path}")
-        except Exception as e:
-            print(f"Error saving used audio: {e}")
+    sequential_results = []
+    output_payload = output
+    if isinstance(output_payload, list) and (len(output_payload) == 0 or isinstance(output_payload[0], dict)):
+        sequential_results = output_payload
+        output_payload = []
+        for entry in sequential_results:
+            payload = entry.get("path")
+            if payload is None:
+                payload = entry.get("audio")
+            output_payload.append(payload)
+
+    multiple_outputs = isinstance(output_payload, list)
 
     # Prepare chapter status defaults
     chapter_status_update = gr.update(value="", visible=False)
@@ -1388,13 +1390,35 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
 
     # Convert to MP3 if requested
     sanitized_regex = (chapter_regex or "").strip()
-    use_chapters = bool(sanitized_regex)
+    use_chapters = bool(sanitized_regex) and not sequential_results
+
+    def _convert_wav_path(path):
+        root, _ = os.path.splitext(path)
+        mp3_path = f"{root}.mp3"
+        return convert_wav_to_mp3(path, mp3_path, bitrate=mp3_bitrate)
 
     if save_as_mp3 and MP3_AVAILABLE:
-        mp3_path = output.replace('.wav', '.mp3')
-        output = convert_wav_to_mp3(output, mp3_path, bitrate=mp3_bitrate)
+        if multiple_outputs:
+            converted_payloads = []
+            for idx, item in enumerate(output_payload):
+                if isinstance(item, str):
+                    converted = _convert_wav_path(item)
+                    converted_payloads.append(converted)
+                    if sequential_results and idx < len(sequential_results):
+                        sequential_results[idx]["path"] = converted
+                        sequential_results[idx]["filename"] = os.path.basename(converted)
+                else:
+                    converted_payloads.append(item)
+            output_payload = converted_payloads
+        else:
+            if isinstance(output_payload, str):
+                converted = _convert_wav_path(output_payload)
+                output_payload = converted
+                if sequential_results:
+                    sequential_results[0]["path"] = converted
+                    sequential_results[0]["filename"] = os.path.basename(converted)
 
-        if use_chapters:
+        if use_chapters and isinstance(output_payload, str):
             if not updated_chapter_state:
                 chapter_status_update = gr.update(
                     value="Chapter regex did not match any sections; no chapters added.",
@@ -1409,7 +1433,7 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
             else:
                 try:
                     total_ms, chapter_entries = apply_chapters_to_mp3(
-                        output,
+                        output_payload,
                         text,
                         updated_chapter_state,
                     )
@@ -1448,8 +1472,76 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
                 visible=True,
             )
 
+    if sequential_results:
+        preview_lines = []
+        max_preview = 5
+        for entry in sequential_results[:max_preview]:
+            number = entry.get("number")
+            title = entry.get("title") or f"Chapter {number}" if number is not None else "Chapter"
+            filename = entry.get("filename") or (
+                os.path.basename(entry.get("path")) if entry.get("path") else ""
+            )
+            if number is not None:
+                prefix = f"Chapter {number}"
+            else:
+                prefix = "Chapter"
+            if filename:
+                preview_lines.append(f"{prefix}: {title} → {filename}")
+            else:
+                preview_lines.append(f"{prefix}: {title}")
+        if len(sequential_results) > max_preview:
+            preview_lines.append(f"... ({len(sequential_results)} chapters total)")
+        status_message = "Generated {count} chapter audio file(s).".format(count=len(sequential_results))
+        if preview_lines:
+            status_message += "\n" + "\n".join(preview_lines)
+        chapter_status_update = gr.update(value=status_message, visible=True)
+        chapter_preview_update = gr.update(value=[], visible=False, type="array")
+
+    # Save used audio if requested (after conversions to keep final path)
+    if save_used_audio and prompt:
+        try:
+            def _first_path_from_payload(payload):
+                if isinstance(payload, str):
+                    return payload
+                if isinstance(payload, list):
+                    for item in payload:
+                        if isinstance(item, str):
+                            return item
+                return None
+
+            base_path = None
+            if sequential_results:
+                for entry in sequential_results:
+                    if entry.get("path"):
+                        base_path = entry["path"]
+                        break
+            if base_path is None:
+                base_path = _first_path_from_payload(output_payload)
+            if base_path is None and output_path:
+                base_path = output_path
+
+            if base_path:
+                base_name = os.path.basename(base_path).rsplit('.', 1)[0]
+            else:
+                base_name = "generated"
+            used_audio_path = os.path.join("outputs/used_audios", f"{base_name}_reference.wav")
+            os.makedirs(os.path.dirname(used_audio_path), exist_ok=True)
+            shutil.copy2(prompt, used_audio_path)
+            print(f"Saved used reference audio to: {used_audio_path}")
+        except Exception as e:
+            print(f"Error saving used audio: {e}")
+
+    display_output = None
+    if multiple_outputs:
+        for item in output_payload:
+            if isinstance(item, (str, tuple)):
+                display_output = item
+                break
+    else:
+        display_output = output_payload
+
     return (
-        gr.update(value=output, visible=True),
+        gr.update(value=display_output, visible=True),
         chapter_status_update,
         chapter_preview_update,
         updated_chapter_state,
@@ -2394,6 +2486,63 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 console_log(
                     f"[{log_prefix}] Using chapter segmentation with {len(active_chunks)} chapter(s)"
                 )
+
+            if active_chapter_mode:
+                console_log(
+                    f"[{log_prefix}] Sequential chapter mode defers tokenization until synthesis."
+                )
+                sequential_preview_rows = []
+                for chunk_idx, chunk in enumerate(active_chunks):
+                    chapter_title = chunk.get("title") or f"Chapter {chunk_idx + 1}"
+                    chapter_text = (chunk.get("text") or "").strip()
+                    snippet = chapter_text.replace("\n", " ")
+                    max_preview_chars = 160
+                    if len(snippet) > max_preview_chars:
+                        snippet = f"{snippet[:max_preview_chars].rstrip()}…"
+                    if not snippet:
+                        snippet = "(Empty chapter)"
+                    sequential_preview_rows.append([
+                        chunk_idx,
+                        f"[{chapter_title}] {snippet}",
+                        "Deferred (queued)",
+                    ])
+                    progress(
+                        0.05 + 0.85 * (chunk_idx + 1) / len(active_chunks),
+                        desc=f"Queued chapter {chunk_idx + 1}/{len(active_chunks)}",
+                    )
+
+                state_value = {
+                    "text": sanitized_text,
+                    "max_tokens": max_tokens,
+                    "segments": [],
+                    "mode": preview_mode,
+                    "processed_at": time.perf_counter(),
+                    "chapter_mode": True,
+                    "chapter_signature": chapter_signature,
+                    "chapters": [
+                        {
+                            "title": chunk.get("title"),
+                            "start": chunk.get("start"),
+                            "end": chunk.get("end"),
+                            "text": chunk.get("text"),
+                        }
+                        for chunk in active_chunks
+                    ],
+                    "total_tokens": None,
+                    "total_segments": None,
+                    "sequential_preview": True,
+                }
+
+                progress(1.0, desc="Preview ready (sequential)")
+                token_message = (
+                    "📊 Sequential chapter processing enabled. Tokenization and segmentation occur per chapter during synthesis."
+                )
+                yield {
+                    segments_preview: gr.update(value=sequential_preview_rows, visible=True, type="array"),
+                    processed_segments_state: state_value,
+                    token_analysis: gr.update(value=token_message, visible=True),
+                }
+                return
 
             chapter_results = []
             total_tokens = 0
