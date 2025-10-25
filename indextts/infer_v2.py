@@ -716,6 +716,7 @@ class IndexTTS2:
                         f"[Generation] Chapter {local_order + 1}/{active_chapter_count} "
                         f"'{chapter_title}' tokenized into {len(chapter_tokens)} tokens in {tokens_elapsed:.2f}s."
                     )
+                return
 
                     split_start = time.perf_counter()
                     split_segments = self.tokenizer.split_segments(
@@ -758,7 +759,8 @@ class IndexTTS2:
                     "segments_total_snapshot": segments_count,
                 }
 
-        segments_iter = segment_iterator()
+            sequential_chapter_results.append(chapter_entry)
+            chapter_wavs.clear()
 
         sequential_chapter_results = []
         chapter_wavs = []
