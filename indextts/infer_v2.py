@@ -678,7 +678,6 @@ class IndexTTS2:
                     continue
                 sanitized_chapters.append((idx, chapter_title, chapter_text))
 
-        chapter_queue = deque()
         if sanitized_chapters:
             active_chapter_count = len(sanitized_chapters)
             sequential_chapter_mode = True
@@ -686,8 +685,6 @@ class IndexTTS2:
                 f"[Generation] Chapter segmentation enabled for {active_chapter_count} chapter"
                 f"{'s' if active_chapter_count != 1 else ''}; synthesizing sequentially."
             )
-            for local_order, (chapter_idx, chapter_title, chapter_text) in enumerate(sanitized_chapters):
-                chapter_queue.append((local_order, chapter_idx, chapter_title, chapter_text))
         elif chapter_segments:
             self._console_log(
                 "[Generation] Chapter segmentation list is empty; falling back to full text."
@@ -697,16 +694,10 @@ class IndexTTS2:
             nonlocal segments_count, text_tokens_list
 
             if sequential_chapter_mode:
-                while chapter_queue:
-                    (
-                        local_order,
-                        chapter_idx,
-                        chapter_title,
-                        chapter_text,
-                    ) = chapter_queue[0]
-
+                for local_order, (chapter_idx, chapter_title, chapter_text) in enumerate(
+                    sanitized_chapters
+                ):
                     if not chapter_text:
-                        chapter_queue.popleft()
                         continue
 
                     tokens_start = time.perf_counter()
@@ -731,7 +722,6 @@ class IndexTTS2:
                     )
 
                     if segment_total == 0:
-                        chapter_queue.popleft()
                         continue
 
                     segments_count += segment_total
@@ -745,8 +735,6 @@ class IndexTTS2:
                             "chapter_segment_total": segment_total,
                             "segments_total_snapshot": segments_count,
                         }
-
-                    chapter_queue.popleft()
                 return
 
             text_tokens_list = self.tokenizer.tokenize(text)
@@ -761,6 +749,10 @@ class IndexTTS2:
 
             sequential_chapter_results.append(chapter_entry)
             chapter_wavs.clear()
+            current_chapter_number = None
+            current_chapter_title = None
+            current_chapter_segment_total = None
+            current_chapter_segment_processed = 0
 
         sequential_chapter_results = []
         chapter_wavs = []
