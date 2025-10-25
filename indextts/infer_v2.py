@@ -484,7 +484,7 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120,
+              verbose=False, max_text_tokens_per_segment=120, chapter_segments=None,
               diffusion_steps=25, inference_cfg_rate=0.7,
               max_speaker_audio_length=15, max_emotion_audio_length=15,
               autoregressive_batch_size=1, max_emotion_sum=0.8,
@@ -660,17 +660,83 @@ class IndexTTS2:
             emo_cond_emb = self.cache_emo_cond
 
         self._set_gr_progress(0.1, "text processing...")
-        text_tokens_list = self.tokenizer.tokenize(text)
-        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
+        segments = []
+        chapter_segment_mapping = []
+        active_chapter_count = 0
+        text_tokens_list = None
+
+        if chapter_segments:
+            sanitized_chapters = []
+            for idx, chapter in enumerate(chapter_segments):
+                if not isinstance(chapter, dict):
+                    continue
+                chapter_text = chapter.get("text") or ""
+                chapter_title = chapter.get("title") or f"Chapter {idx + 1}"
+                if not chapter_text.strip():
+                    continue
+                sanitized_chapters.append((idx, chapter_title, chapter_text))
+
+            active_chapter_count = len(sanitized_chapters)
+            if sanitized_chapters:
+                self._console_log(
+                    f"[Generation] Chapter segmentation enabled for {active_chapter_count} chapter"
+                    f"{'s' if active_chapter_count != 1 else ''}."
+                )
+
+                for local_order, (chapter_idx, chapter_title, chapter_text) in enumerate(sanitized_chapters):
+                    tokens_start = time.perf_counter()
+                    chapter_tokens = self.tokenizer.tokenize(chapter_text)
+                    tokens_elapsed = time.perf_counter() - tokens_start
+                    self._console_log(
+                        f"[Generation] Chapter {local_order + 1}/{active_chapter_count} "
+                        f"'{chapter_title}' tokenized into {len(chapter_tokens)} tokens in {tokens_elapsed:.2f}s."
+                    )
+
+                    split_start = time.perf_counter()
+                    split_segments = self.tokenizer.split_segments(
+                        chapter_tokens,
+                        max_text_tokens_per_segment=max_text_tokens_per_segment,
+                    )
+                    split_elapsed = time.perf_counter() - split_start
+                    self._console_log(
+                        f"[Generation] Chapter '{chapter_title}' prepared {len(split_segments)} segment"
+                        f"{'s' if len(split_segments) != 1 else ''} in {split_elapsed:.2f}s."
+                    )
+                    for segment_tokens in split_segments:
+                        segments.append(segment_tokens)
+                        chapter_segment_mapping.append({
+                            "chapter_index": chapter_idx,
+                            "chapter_title": chapter_title,
+                        })
+            else:
+                self._console_log("[Generation] Chapter segmentation list is empty; falling back to full text.")
+                text_tokens_list = self.tokenizer.tokenize(text)
+                segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
+        else:
+            text_tokens_list = self.tokenizer.tokenize(text)
+            segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
+
         segments_count = len(segments)
         if segments_count:
-            self._console_log(
-                f"[Generation] Starting synthesis for {segments_count} segment{'s' if segments_count != 1 else ''}."
-            )
+            if chapter_segment_mapping:
+                self._console_log(
+                    f"[Generation] Starting synthesis for {segments_count} segment"
+                    f"{'s' if segments_count != 1 else ''} across {active_chapter_count} chapter"
+                    f"{'s' if active_chapter_count != 1 else ''}."
+                )
+            else:
+                self._console_log(
+                    f"[Generation] Starting synthesis for {segments_count} segment"
+                    f"{'s' if segments_count != 1 else ''}."
+                )
         else:
             self._console_log("[Generation] No segments found; nothing to synthesize.")
+
         if verbose:
-            print("text_tokens_list:", text_tokens_list)
+            if text_tokens_list is not None:
+                print("text_tokens_list:", text_tokens_list)
+            else:
+                print("chapter segmentation active; tokens collected per chapter")
             print("segments count:", segments_count)
             print("max_text_tokens_per_segment:", max_text_tokens_per_segment)
             print(*segments, sep="\n")
@@ -890,6 +956,17 @@ class IndexTTS2:
             remaining_segments = max(segments_count - processed_segments, 0)
             elapsed_since_start = now - synthesis_start
             segment_elapsed = now - segment_start_time
+            chapter_suffix = ""
+            if chapter_segment_mapping:
+                mapping = chapter_segment_mapping[min(seg_idx, len(chapter_segment_mapping) - 1)]
+                chapter_idx = mapping.get("chapter_index")
+                chapter_title = mapping.get("chapter_title") or (f"Chapter {chapter_idx + 1}" if chapter_idx is not None else "Chapter")
+                if chapter_title and len(chapter_title) > 60:
+                    chapter_title = chapter_title[:57] + "..."
+                if chapter_idx is not None:
+                    chapter_suffix = f" [Chapter {chapter_idx + 1}: {chapter_title}]"
+                else:
+                    chapter_suffix = f" [Chapter: {chapter_title}]"
             if processed_segments > 0 and remaining_segments > 0:
                 avg_time = elapsed_since_start / processed_segments
                 eta_seconds = avg_time * remaining_segments
@@ -897,7 +974,7 @@ class IndexTTS2:
             else:
                 eta_str = "0.0s"
             self._console_log(
-                f"[Generation] Finished segment {processed_segments}/{segments_count} in {segment_elapsed:.2f}s "
+                f"[Generation] Finished segment {processed_segments}/{segments_count}{chapter_suffix} in {segment_elapsed:.2f}s "
                 f"({elapsed_since_start:.1f}s elapsed, {remaining_segments} remaining, ETA {eta_str})."
             )
         end_time = time.perf_counter()
