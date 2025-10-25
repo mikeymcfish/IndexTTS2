@@ -1067,26 +1067,22 @@ def save_mp3_chapter_titles(table_rows, editor_state):
     )
 
 
-def compute_chapter_preview_data(enable_chapters, text, regex_pattern):
+def compute_chapter_preview_data(text, regex_pattern):
     """Compute chapter preview matches based on a regex pattern."""
 
     sanitized_text = text or ""
     sanitized_regex = (regex_pattern or "").strip()
-    feedback_enabled = bool(enable_chapters)
 
     if not sanitized_text.strip():
-        message = "Enter text to analyze for chapters." if feedback_enabled else ""
-        return [], message, [], feedback_enabled
+        return [], "Enter text to analyze for chapters.", [], False
 
     if not sanitized_regex:
-        message = "Enter a regex to detect chapter headings." if feedback_enabled else ""
-        return [], message, [], feedback_enabled
+        return [], "Enter a regex to detect chapter headings.", [], False
 
     try:
         pattern = re.compile(sanitized_regex, flags=re.MULTILINE)
     except re.error as exc:
-        message = f"Regex error: {exc}" if feedback_enabled else ""
-        return [], message, [], feedback_enabled
+        return [], f"Regex error: {exc}", [], False
 
     matches = []
     for idx, match in enumerate(pattern.finditer(sanitized_text)):
@@ -1100,8 +1096,7 @@ def compute_chapter_preview_data(enable_chapters, text, regex_pattern):
             break
 
     if not matches:
-        message = "No chapters matched the provided regex." if feedback_enabled else ""
-        return [], message, [], feedback_enabled
+        return [], "No chapters matched the provided regex.", [], False
 
     table_rows = build_chapter_table(matches, len(sanitized_text))
     return matches, "" if feedback_enabled else "", table_rows, feedback_enabled
@@ -1265,7 +1260,7 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
                emo_text,emo_random,
                max_text_tokens_per_segment,
                chapter_segments,
-               enable_chapters,
+               chapter_regex,
                chapters_state,
                save_as_mp3,
                # Expert params (in order from expert_params list)
@@ -1390,11 +1385,14 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
     updated_chapter_state = list(chapters_state) if isinstance(chapters_state, (list, tuple)) else []
 
     # Convert to MP3 if requested
+    sanitized_regex = (chapter_regex or "").strip()
+    use_chapters = bool(sanitized_regex)
+
     if save_as_mp3 and MP3_AVAILABLE:
         mp3_path = output.replace('.wav', '.mp3')
         output = convert_wav_to_mp3(output, mp3_path, bitrate=mp3_bitrate)
 
-        if enable_chapters:
+        if use_chapters:
             if not updated_chapter_state:
                 chapter_status_update = gr.update(
                     value="Chapter regex did not match any sections; no chapters added.",
@@ -1436,7 +1434,7 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
                         value=f"Failed to add chapters: {exc}",
                         visible=True,
                     )
-    elif enable_chapters:
+    elif use_chapters:
         if not MP3_AVAILABLE:
             chapter_status_update = gr.update(
                 value="MP3 conversion is unavailable; chapters can only be embedded into MP3 files.",
@@ -1506,6 +1504,24 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 if prompt_list:
                     default = prompt_list[0]
 
+                with gr.Accordion("Chapter Settings", open=False):
+                    gr.Markdown(
+                        "Provide a chapter start regex to detect chapters. Matches are embedded into MP3 exports automatically."
+                    )
+                    chapter_regex_input = gr.Textbox(
+                        label="Chapter Start Regex",
+                        placeholder=r"e.g., ^Chapter \\d+",
+                        info="Regular expression evaluated with multiline mode to detect chapter headings.",
+                    )
+                    chapter_error = gr.Markdown(value="", visible=False)
+                    chapter_preview = gr.Dataframe(
+                        headers=["Chapter #", "Title", "Start Char", "Preview Start"],
+                        interactive=False,
+                        visible=False,
+                        type="array",
+                    )
+                    chapter_status = gr.Markdown(value="", visible=False)
+
             # Middle column for text input
             with gr.Column():
                 text_file_upload = gr.File(
@@ -1562,27 +1578,6 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                         interactive=False,
                         visible=False
                     )
-
-        with gr.Accordion("Chapter Settings", open=False):
-            enable_chapters = gr.Checkbox(
-                label="Enable MP3 Chapters",
-                value=False,
-                info="When enabled, matches in the regex below will become chapter markers embedded into the exported MP3.",
-            )
-            chapter_regex_input = gr.Textbox(
-                label="Chapter Start Regex",
-                value=r"^Chapter\s+\d+",
-                placeholder=r"e.g., ^Chapter \d+",
-                info="Provide a regular expression that matches the beginning of each chapter. Use multiline mode constructs such as ^ for line starts.",
-            )
-            chapter_error = gr.Markdown(value="", visible=False)
-            chapter_preview = gr.Dataframe(
-                headers=["Chapter #", "Title", "Start Char", "Preview Start"],
-                interactive=False,
-                visible=False,
-                type="array",
-            )
-            chapter_status = gr.Markdown(value="", visible=False)
 
         with gr.Accordion("Function Settings"):
             # 情感控制选项部分 - now showing ALL options including experimental
@@ -1754,26 +1749,6 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 interactive=False,
             )
             processed_segments_state = gr.State(value=None)
-
-        with gr.Accordion("Chapter Settings", open=False):
-            enable_chapters = gr.Checkbox(
-                label="Enable MP3 Chapters",
-                value=False,
-                info="When enabled, matches in the regex below will become chapter markers embedded into the exported MP3.",
-            )
-            chapter_regex_input = gr.Textbox(
-                label="Chapter Start Regex",
-                placeholder=r"e.g., ^Chapter \\d+",
-                info="Provide a regular expression that matches the beginning of each chapter. Use multiline mode constructs such as ^ for line starts.",
-            )
-            chapter_error = gr.Markdown(value="", visible=False)
-            chapter_preview = gr.Dataframe(
-                headers=["Chapter #", "Title", "Start Char", "Preview Start"],
-                interactive=False,
-                visible=False,
-                type="array",
-            )
-            chapter_status = gr.Markdown(value="", visible=False)
 
     with gr.Tab("Advanced Parameters"):
         gr.Markdown("### 🎯 Advanced Audio Generation Parameters")
@@ -2217,7 +2192,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             )
 
     def load_text_file_contents(text_file, max_text_tokens_per_segment, preview_mode,
-                                enable_chapters, chapter_regex, progress=gr.Progress(track_tqdm=True)):
+                                chapter_regex, progress=gr.Progress(track_tqdm=True)):
         """Load text content from an uploaded .txt file."""
         if not text_file:
             yield (
@@ -2294,7 +2269,6 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             )
 
             chapter_matches, chapter_error_msg, chapter_rows, table_visible = compute_chapter_preview_data(
-                enable_chapters,
                 content,
                 chapter_regex,
             )
@@ -2307,13 +2281,14 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
             chapter_error_update = gr.update(
                 value=chapter_error_msg,
-                visible=bool(chapter_error_msg) and table_visible,
+                visible=bool(chapter_error_msg),
             )
 
             max_tokens = parse_max_tokens(max_text_tokens_per_segment)
             token_count = len(tts.tokenizer.tokenize(content))
             estimated_segments = math.ceil(token_count / max_tokens) if max_tokens else None
-            chapter_count = len(chapter_matches) if enable_chapters and chapter_matches else None
+            sanitized_regex = (chapter_regex or "").strip()
+            chapter_count = len(chapter_matches) if sanitized_regex and chapter_matches else None
             token_message = format_token_analysis(token_count, estimated_segments, max_tokens, chapter_count)
             token_analysis_update = gr.update(value=token_message, visible=bool(token_message))
 
@@ -2350,10 +2325,9 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             )
             return
 
-    def update_chapter_preview(enable_chapters, text, chapter_regex):
+    def update_chapter_preview(text, chapter_regex):
         """Update chapter preview table when text or regex changes."""
         matches, error_message, table_rows, table_visible = compute_chapter_preview_data(
-            enable_chapters,
             text,
             chapter_regex,
         )
@@ -2366,7 +2340,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
         error_update = gr.update(
             value=error_message,
-            visible=bool(error_message) and table_visible,
+            visible=bool(error_message),
         )
 
         status_update = gr.update(value="", visible=False)
@@ -2615,7 +2589,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
         emo_random,
         max_text_tokens_per_segment,
         use_chapter_segmentation,
-        enable_chapters,
+        chapter_regex,
         chapters_state,
         save_as_mp3,
         diffusion_steps,
@@ -2699,7 +2673,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             emo_random,
             max_text_tokens_per_segment,
             chapter_segments,
-            enable_chapters,
+            chapter_regex,
             chapters_state,
             save_as_mp3,
             diffusion_steps,
@@ -2802,25 +2776,19 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
     text_file_upload.change(
         load_text_file_contents,
-        inputs=[text_file_upload, max_text_tokens_per_segment, segments_preview_mode, enable_chapters, chapter_regex_input],
+        inputs=[text_file_upload, max_text_tokens_per_segment, segments_preview_mode, chapter_regex_input],
         outputs=[input_text_single, segments_preview, text_file_status, chapter_preview, chapter_error, chapters_state, chapter_status, token_analysis, processed_segments_state]
-    )
-
-    enable_chapters.change(
-        update_chapter_preview,
-        inputs=[enable_chapters, input_text_single, chapter_regex_input],
-        outputs=[chapter_preview, chapter_error, chapters_state, chapter_status]
     )
 
     chapter_regex_input.change(
         update_chapter_preview,
-        inputs=[enable_chapters, input_text_single, chapter_regex_input],
+        inputs=[input_text_single, chapter_regex_input],
         outputs=[chapter_preview, chapter_error, chapters_state, chapter_status]
     )
 
     input_text_single.change(
         update_chapter_preview,
-        inputs=[enable_chapters, input_text_single, chapter_regex_input],
+        inputs=[input_text_single, chapter_regex_input],
         outputs=[chapter_preview, chapter_error, chapters_state, chapter_status]
     )
 
@@ -2884,7 +2852,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 emo_random,
                 max_text_tokens_per_segment,
                 chapter_segmentation,
-                enable_chapters,
+                chapter_regex_input,
                 chapters_state,
                 save_as_mp3,
                 *expert_params,
@@ -2916,7 +2884,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 emo_random,
                 max_text_tokens_per_segment,
                 chapter_segmentation,
-                enable_chapters,
+                chapter_regex_input,
                 chapters_state,
                 save_as_mp3,
                 *expert_params,
