@@ -1,6 +1,7 @@
 import html
 import importlib.util
 import json
+import math
 import os
 import sys
 import threading
@@ -349,6 +350,121 @@ def build_segments_preview_data(text, max_tokens, log_prefix="Segmentation previ
     except Exception as exc:
         console_log(f"Error building segments preview: {exc}")
         return []
+
+
+def build_chapter_signature(chapters_state):
+    """Create a stable signature from chapter matches for change detection."""
+    signature_entries = []
+    if isinstance(chapters_state, (list, tuple)):
+        for idx, chapter in enumerate(chapters_state):
+            if not isinstance(chapter, dict):
+                continue
+            title = chapter.get("title")
+            if isinstance(title, str):
+                title = title.strip()
+            else:
+                title = ""
+            if not title:
+                title = f"Chapter {idx + 1}"
+            try:
+                start_char = int(chapter.get("start_char", 0))
+            except (TypeError, ValueError):
+                start_char = 0
+            signature_entries.append((max(0, start_char), title))
+
+    signature_entries.sort(key=lambda item: item[0])
+    deduped = []
+    for start, title in signature_entries:
+        if deduped and start == deduped[-1][0] and title == deduped[-1][1]:
+            continue
+        deduped.append((start, title))
+    return tuple(deduped)
+
+
+def build_segmentation_chapters(text, chapters_state):
+    """Build ordered chapter chunks for chapter-aware segmentation."""
+    sanitized_text = text or ""
+    total_length = len(sanitized_text)
+    if total_length == 0:
+        return []
+
+    signature_entries = list(build_chapter_signature(chapters_state))
+    chunks = []
+
+    if not signature_entries:
+        if sanitized_text.strip():
+            chunks.append({
+                "title": "Full Text",
+                "start": 0,
+                "end": total_length,
+                "text": sanitized_text,
+            })
+        return chunks
+
+    # Preface chunk before first chapter
+    first_start = signature_entries[0][0]
+    if first_start > 0:
+        prefix_text = sanitized_text[:first_start]
+        if prefix_text.strip():
+            chunks.append({
+                "title": "Preface",
+                "start": 0,
+                "end": first_start,
+                "text": prefix_text,
+            })
+
+    for entry_idx, (start_char, title) in enumerate(signature_entries):
+        start = max(0, min(total_length, start_char))
+        next_start = total_length
+        if entry_idx + 1 < len(signature_entries):
+            next_start = max(start, min(total_length, signature_entries[entry_idx + 1][0]))
+        chapter_text = sanitized_text[start:next_start]
+        if not chapter_text.strip():
+            continue
+        chunks.append({
+            "title": title,
+            "start": start,
+            "end": next_start,
+            "text": chapter_text,
+        })
+
+    if chunks:
+        last_end = chunks[-1]["end"]
+    else:
+        last_end = 0
+
+    if last_end < total_length:
+        trailing_text = sanitized_text[last_end:]
+        if trailing_text.strip():
+            chunks.append({
+                "title": "Postscript",
+                "start": last_end,
+                "end": total_length,
+                "text": trailing_text,
+            })
+
+    # Ensure index order metadata
+    for idx, chunk in enumerate(chunks):
+        chunk["index"] = idx
+
+    return chunks
+
+
+def format_token_analysis(total_tokens, segment_count, max_tokens, chapter_count=None):
+    """Format a human-readable token analysis message."""
+    if total_tokens is None or segment_count is None:
+        return ""
+
+    segment_part = f"across {segment_count} segment{'s' if segment_count != 1 else ''}" if segment_count else "with no segments"
+    message = (
+        f"📊 Token analysis: {total_tokens} token{'s' if total_tokens != 1 else ''} "
+        f"{segment_part} (max {max_tokens} tokens/segment)."
+    )
+
+    if chapter_count is not None:
+        message += f" Chapter segmentation active for {chapter_count} chapter{'s' if chapter_count != 1 else ''}."
+
+    return message
 
 
 def build_chapter_table(chapters, text_length, total_duration_ms=None):
@@ -1143,6 +1259,7 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                emo_text,emo_random,
                max_text_tokens_per_segment,
+               chapter_segments,
                enable_chapters,
                chapters_state,
                save_as_mp3,
@@ -1236,6 +1353,7 @@ def gen_single(emo_control_method,prompt, text, save_used_audio, output_filename
                        use_emo_text=(emo_control_method==3), emo_text=emo_text,use_random=emo_random,
                        verbose=cmd_args.verbose,
                        max_text_tokens_per_segment=max_tokens,
+                       chapter_segments=chapter_segments,
                        interval_silence=int(interval_silence),
                        diffusion_steps=int(diffusion_steps),
                        inference_cfg_rate=float(inference_cfg_rate),
@@ -1389,6 +1507,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                     label="Upload Text File", file_count="single", file_types=[".txt"], type="filepath"
                 )
                 text_file_status = gr.Markdown(value="", visible=False)
+                token_analysis = gr.Markdown(value="", visible=False)
                 input_text_single = gr.TextArea(
                     label="Text to Synthesize",
                     key="input_text_single",
@@ -1612,6 +1731,11 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 )
 
         with gr.Accordion("Preview Sentence Segmentation Results", open=True) as segments_settings:
+            chapter_segmentation = gr.Checkbox(
+                label="Chapter Segmentation",
+                value=False,
+                info="When enabled, segments are generated chapter-by-chapter using the detected chapter markers.",
+            )
             segments_preview_mode = gr.Radio(
                 label="Segmentation Preview Mode",
                 choices=["Standard (instant)", "Experimental (progressive)"],
@@ -2099,6 +2223,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 gr.update(value="", visible=False),
                 [],
                 gr.update(value="", visible=False),
+                gr.update(value="", visible=False),
                 None,
             )
             return
@@ -2112,6 +2237,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 gr.update(),
                 gr.update(value="", visible=False),
                 [],
+                gr.update(value="", visible=False),
                 gr.update(value="", visible=False),
                 None,
             )
@@ -2179,6 +2305,13 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 visible=bool(chapter_error_msg) and table_visible,
             )
 
+            max_tokens = parse_max_tokens(max_text_tokens_per_segment)
+            token_count = len(tts.tokenizer.tokenize(content))
+            estimated_segments = math.ceil(token_count / max_tokens) if max_tokens else None
+            chapter_count = len(chapter_matches) if enable_chapters and chapter_matches else None
+            token_message = format_token_analysis(token_count, estimated_segments, max_tokens, chapter_count)
+            token_analysis_update = gr.update(value=token_message, visible=bool(token_message))
+
             file_status = gr.update(
                 value=f"Loaded text file: {os.path.basename(file_path)} ({len(content)} characters)",
                 visible=True,
@@ -2194,6 +2327,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 chapter_error_update,
                 chapter_matches,
                 gr.update(value="", visible=False),
+                token_analysis_update,
                 None,
             )
             return
@@ -2205,6 +2339,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 gr.update(),
                 gr.update(value="", visible=False),
                 [],
+                gr.update(value="", visible=False),
                 gr.update(value="", visible=False),
                 None,
             )
@@ -2233,128 +2368,226 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
         return table_update, error_update, matches, status_update
 
+
+
     def process_segments(text, max_text_tokens_per_segment, preview_mode,
+                         use_chapter_segmentation, chapters_state,
                          progress=gr.Progress(track_tqdm=True)):
         sanitized_text = text or ""
         if not sanitized_text.strip():
             yield {
                 segments_preview: gr.update(value=[], visible=True),
                 processed_segments_state: None,
+                token_analysis: gr.update(value="", visible=False),
             }
             return
 
         max_tokens = parse_max_tokens(max_text_tokens_per_segment)
 
-        if preview_mode == "Experimental (progressive)":
-            try:
-                overall_start = time.perf_counter()
-                progress(0.0, desc="Tokenizing text")
+        requested_chapter_mode = bool(use_chapter_segmentation)
+        chapter_signature = build_chapter_signature(chapters_state) if requested_chapter_mode else ()
+        chapter_chunks = build_segmentation_chapters(sanitized_text, chapters_state) if requested_chapter_mode else []
+        active_chapter_mode = requested_chapter_mode and bool(chapter_chunks)
+
+        if requested_chapter_mode and not active_chapter_mode:
+            console_log(
+                "[Segmentation] Chapter segmentation enabled but no chapters detected; processing full text instead."
+            )
+
+        active_chunks = chapter_chunks if active_chapter_mode else [{
+            "title": "Full Text",
+            "start": 0,
+            "end": len(sanitized_text),
+            "text": sanitized_text,
+            "index": 0,
+        }]
+
+        try:
+            overall_start = time.perf_counter()
+            progress(0.0, desc="Preparing segmentation")
+            log_prefix = "Segmentation preview (experimental)" if preview_mode == "Experimental (progressive)" else "Segmentation preview (standard)"
+            console_log(
+                f"[{log_prefix}] Preparing preview with max {max_tokens} tokens per segment"
+            )
+            if active_chapter_mode:
                 console_log(
-                    f"[Segmentation preview (experimental/input)] Tokenizing {len(sanitized_text)} characters..."
+                    f"[{log_prefix}] Using chapter segmentation with {len(active_chunks)} chapter(s)"
+                )
+
+            chapter_results = []
+            total_tokens = 0
+            total_segments = 0
+
+            for chunk_idx, chunk in enumerate(active_chunks):
+                chapter_title = chunk.get("title") or f"Chapter {chunk_idx + 1}"
+                chapter_text = chunk.get("text", "") or ""
+                chapter_char_len = len(chapter_text)
+
+                if not chapter_text.strip():
+                    console_log(
+                        f"[{log_prefix}] Chapter '{chapter_title}' is empty; skipping."
+                    )
+                    chapter_results.append({
+                        "meta": chunk,
+                        "segments": [],
+                        "token_total": 0,
+                    })
+                    continue
+
+                console_log(
+                    f"[{log_prefix}] Tokenizing chapter {chunk_idx + 1}/{len(active_chunks)} '{chapter_title}' ({chapter_char_len} characters)"
                 )
                 token_start = time.perf_counter()
-                text_tokens_list = tts.tokenizer.tokenize(sanitized_text)
+                chapter_tokens = tts.tokenizer.tokenize(chapter_text)
                 token_elapsed = time.perf_counter() - token_start
                 console_log(
-                    f"[Segmentation preview (experimental/input)] Tokenized {len(text_tokens_list)} tokens in {token_elapsed:.2f}s"
+                    f"[{log_prefix}] Chapter '{chapter_title}' tokenized into {len(chapter_tokens)} tokens in {token_elapsed:.2f}s"
                 )
-                progress(0.2, desc="Splitting into segments")
-                console_log(
-                    f"[Segmentation preview (experimental/input)] Splitting tokens into segments (max {max_tokens})..."
-                )
-                segments = tts.tokenizer.split_segments(
-                    text_tokens_list,
+
+                split_start = time.perf_counter()
+                split_segments = tts.tokenizer.split_segments(
+                    chapter_tokens,
                     max_text_tokens_per_segment=max_tokens,
                 )
-                total_tokens = sum(len(segment_tokens) for segment_tokens in segments)
+                split_elapsed = time.perf_counter() - split_start
                 console_log(
-                    f"[Segmentation preview (experimental/input)] Prepared {len(segments)} segments; streaming incremental updates."
+                    f"[{log_prefix}] Chapter '{chapter_title}' produced {len(split_segments)} segment(s) in {split_elapsed:.2f}s"
                 )
-                prep_elapsed = time.perf_counter() - overall_start
-                console_log(
-                    f"[Segmentation preview (experimental/input)] Total preparation time {prep_elapsed:.2f}s ({total_tokens} tokens)."
-                )
-            except Exception as exc:
-                progress(1.0, desc="Failed to build preview")
-                console_log(f"Error during experimental preview: {exc}")
-                yield {
-                    segments_preview: gr.update(value=[], visible=True),
-                    processed_segments_state: None,
-                }
-                return
 
-            total_segments = len(segments)
+                chapter_segment_rows = []
+                chapter_token_total = 0
+                for seg_idx, segment_tokens in enumerate(split_segments):
+                    segment_str = ''.join(segment_tokens)
+                    token_count = len(segment_tokens)
+                    chapter_segment_rows.append({
+                        "index": seg_idx,
+                        "text": segment_str,
+                        "token_count": token_count,
+                    })
+                    chapter_token_total += token_count
+
+                total_tokens += chapter_token_total
+                total_segments += len(chapter_segment_rows)
+                chapter_results.append({
+                    "meta": chunk,
+                    "segments": chapter_segment_rows,
+                    "token_total": chapter_token_total,
+                })
+
+                if active_chunks:
+                    progress(
+                        0.1 + 0.1 * (chunk_idx + 1) / len(active_chunks),
+                        desc=f"Processed chapter {chunk_idx + 1}/{len(active_chunks)}",
+                    )
+
             if total_segments == 0:
                 progress(1.0, desc="No segments found")
                 yield {
-                    segments_preview: gr.update(value=[], visible=True),
+                    segments_preview: gr.update(value=[], visible=True, type="array"),
                     processed_segments_state: None,
+                    token_analysis: gr.update(value="", visible=False),
                 }
                 return
 
-            preview_rows = []
-            stream_start = time.perf_counter()
-            last_log_time = None
-            for idx, segment_tokens in enumerate(segments):
-                segment_str = ''.join(segment_tokens)
-                tokens_count = len(segment_tokens)
-                preview_rows.append([idx, segment_str, tokens_count])
-                progress(0.2 + 0.7 * ((idx + 1) / total_segments), desc=f"Building preview ({idx + 1}/{total_segments})")
-                last_log_time = log_segmentation_progress(
-                    "Segmentation preview (experimental)",
-                    idx + 1,
+            flattened_preview = []
+            global_index = 0
+            for chapter_data in chapter_results:
+                for segment in chapter_data["segments"]:
+                    flattened_preview.append([global_index, segment["text"], segment["token_count"]])
+                    global_index += 1
+
+            token_message = format_token_analysis(
+                total_tokens,
+                total_segments,
+                max_tokens,
+                chapter_count=len(active_chunks) if active_chapter_mode else None,
+            )
+
+            state_value = {
+                "text": sanitized_text,
+                "max_tokens": max_tokens,
+                "segments": list(flattened_preview),
+                "mode": preview_mode,
+                "processed_at": time.perf_counter(),
+                "chapter_mode": active_chapter_mode,
+                "chapter_signature": chapter_signature if active_chapter_mode else (),
+                "chapters": [
+                    {
+                        "title": chapter_data["meta"].get("title"),
+                        "start": chapter_data["meta"].get("start"),
+                        "end": chapter_data["meta"].get("end"),
+                        "text": chapter_data["meta"].get("text"),
+                    }
+                    for chapter_data in chapter_results
+                    if active_chapter_mode
+                ],
+                "total_tokens": total_tokens,
+                "total_segments": total_segments,
+            }
+
+            if preview_mode == "Experimental (progressive)":
+                stream_start = time.perf_counter()
+                last_log_time = None
+                preview_rows = []
+                for idx, row in enumerate(flattened_preview):
+                    preview_rows.append(row)
+                    progress(
+                        0.2 + 0.7 * ((idx + 1) / total_segments),
+                        desc=f"Building preview ({idx + 1}/{total_segments})",
+                    )
+                    last_log_time = log_segmentation_progress(
+                        log_prefix,
+                        idx + 1,
+                        total_segments,
+                        stream_start,
+                        last_log_time,
+                    )
+                    yield {
+                        segments_preview: gr.update(value=list(preview_rows), visible=True, type="array"),
+                    }
+
+                progress(1.0, desc="Preview ready")
+                log_segmentation_summary(
+                    log_prefix,
                     total_segments,
-                    stream_start,
-                    last_log_time,
+                    total_tokens,
+                    time.perf_counter() - overall_start,
+                )
+
+                yield {
+                    processed_segments_state: state_value,
+                    token_analysis: gr.update(value=token_message, visible=bool(token_message)),
+                }
+            else:
+                progress(1.0, desc="Preview ready")
+                log_segmentation_summary(
+                    log_prefix,
+                    total_segments,
+                    total_tokens,
+                    time.perf_counter() - overall_start,
                 )
                 yield {
-                    segments_preview: gr.update(value=list(preview_rows), visible=True, type="array"),
+                    segments_preview: gr.update(value=flattened_preview, visible=True, type="array"),
+                    processed_segments_state: state_value,
+                    token_analysis: gr.update(value=token_message, visible=bool(token_message)),
                 }
-
-            progress(1.0, desc="Preview ready")
-            log_segmentation_summary(
-                "Segmentation preview (experimental)",
-                total_segments,
-                total_tokens,
-                time.perf_counter() - overall_start,
-            )
-
+        except Exception as exc:
+            progress(1.0, desc="Failed to build preview")
+            console_log(f"Error during segmentation preview: {exc}")
             yield {
-                processed_segments_state: {
-                    "text": sanitized_text,
-                    "max_tokens": max_tokens,
-                    "segments": list(preview_rows),
-                    "mode": preview_mode,
-                    "processed_at": time.perf_counter(),
-                }
+                segments_preview: gr.update(value=[], visible=True),
+                processed_segments_state: None,
+                token_analysis: gr.update(value="", visible=False),
             }
-        else:
-            console_log(
-                f"[Segmentation preview (standard/input)] Preparing preview with max {max_tokens} tokens per segment..."
-            )
-            data = build_segments_preview_data(
-                sanitized_text,
-                max_tokens,
-                log_prefix="Segmentation preview (standard)",
-            )
-            state_value = None
-            if data:
-                state_value = {
-                    "text": sanitized_text,
-                    "max_tokens": max_tokens,
-                    "segments": list(data),
-                    "mode": preview_mode,
-                    "processed_at": time.perf_counter(),
-                }
 
-            yield {
-                segments_preview: gr.update(value=data, visible=True, type="array"),
-                processed_segments_state: state_value,
-            }
 
     def invalidate_processed_segments(*_):
         """Clear stored segments when text or settings change."""
-        return gr.update(value=[], visible=True, type="array"), None
+        return (
+            gr.update(value=[], visible=True, type="array"),
+            None,
+            gr.update(value="", visible=False),
+        )
 
     def generate_from_processed(
         segments_state,
@@ -2376,6 +2609,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
         emo_text,
         emo_random,
         max_text_tokens_per_segment,
+        use_chapter_segmentation,
         enable_chapters,
         chapters_state,
         save_as_mp3,
@@ -2427,6 +2661,19 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
         ):
             raise gr.Error("Text or segmentation settings have changed. Process segments again before generating.")
 
+        state_chapter_mode = bool(segments_state.get("chapter_mode"))
+        requested_chapter_mode = bool(use_chapter_segmentation)
+        if state_chapter_mode != requested_chapter_mode:
+            raise gr.Error("Chapter segmentation setting has changed. Process segments again before generating.")
+
+        chapter_segments = None
+        if state_chapter_mode:
+            stored_signature = tuple(segments_state.get("chapter_signature") or ())
+            current_signature = build_chapter_signature(chapters_state)
+            if stored_signature != current_signature:
+                raise gr.Error("Chapter boundaries have changed. Process segments again before generating.")
+            chapter_segments = segments_state.get("chapters") or []
+
         return gen_single(
             emo_control_method,
             prompt,
@@ -2446,6 +2693,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             emo_text,
             emo_random,
             max_text_tokens_per_segment,
+            chapter_segments,
             enable_chapters,
             chapters_state,
             save_as_mp3,
@@ -2526,25 +2774,31 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
     input_text_single.change(
         invalidate_processed_segments,
         inputs=[],
-        outputs=[segments_preview, processed_segments_state]
+        outputs=[segments_preview, processed_segments_state, token_analysis]
     )
 
     max_text_tokens_per_segment.change(
         invalidate_processed_segments,
         inputs=[],
-        outputs=[segments_preview, processed_segments_state]
+        outputs=[segments_preview, processed_segments_state, token_analysis]
     )
 
     segments_preview_mode.change(
         invalidate_processed_segments,
         inputs=[],
-        outputs=[segments_preview, processed_segments_state]
+        outputs=[segments_preview, processed_segments_state, token_analysis]
+    )
+
+    chapter_segmentation.change(
+        invalidate_processed_segments,
+        inputs=[],
+        outputs=[segments_preview, processed_segments_state, token_analysis]
     )
 
     text_file_upload.change(
         load_text_file_contents,
         inputs=[text_file_upload, max_text_tokens_per_segment, segments_preview_mode, enable_chapters, chapter_regex_input],
-        outputs=[input_text_single, segments_preview, text_file_status, chapter_preview, chapter_error, chapters_state, chapter_status, processed_segments_state]
+        outputs=[input_text_single, segments_preview, text_file_status, chapter_preview, chapter_error, chapters_state, chapter_status, token_analysis, processed_segments_state]
     )
 
     enable_chapters.change(
@@ -2595,14 +2849,14 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
     process_segments_button.click(
         process_segments,
-        inputs=[input_text_single, max_text_tokens_per_segment, segments_preview_mode],
-        outputs=[segments_preview, processed_segments_state],
+        inputs=[input_text_single, max_text_tokens_per_segment, segments_preview_mode, chapter_segmentation, chapters_state],
+        outputs=[segments_preview, processed_segments_state, token_analysis],
     )
 
     process_and_generate_button.click(
         process_segments,
-        inputs=[input_text_single, max_text_tokens_per_segment, segments_preview_mode],
-        outputs=[segments_preview, processed_segments_state],
+        inputs=[input_text_single, max_text_tokens_per_segment, segments_preview_mode, chapter_segmentation, chapters_state],
+        outputs=[segments_preview, processed_segments_state, token_analysis],
     ).then(
         generate_from_processed,
         inputs=[processed_segments_state,
@@ -2624,6 +2878,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 emo_text,
                 emo_random,
                 max_text_tokens_per_segment,
+                chapter_segmentation,
                 enable_chapters,
                 chapters_state,
                 save_as_mp3,
@@ -2655,6 +2910,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 emo_text,
                 emo_random,
                 max_text_tokens_per_segment,
+                chapter_segmentation,
                 enable_chapters,
                 chapters_state,
                 save_as_mp3,
