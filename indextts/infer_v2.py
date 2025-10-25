@@ -1,5 +1,6 @@
 import itertools
 import os
+from collections import deque
 from subprocess import CalledProcessError
 
 os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
@@ -677,6 +678,7 @@ class IndexTTS2:
                     continue
                 sanitized_chapters.append((idx, chapter_title, chapter_text))
 
+        chapter_queue = deque()
         if sanitized_chapters:
             active_chapter_count = len(sanitized_chapters)
             sequential_chapter_mode = True
@@ -684,54 +686,67 @@ class IndexTTS2:
                 f"[Generation] Chapter segmentation enabled for {active_chapter_count} chapter"
                 f"{'s' if active_chapter_count != 1 else ''}; synthesizing sequentially."
             )
+            for local_order, (chapter_idx, chapter_title, chapter_text) in enumerate(sanitized_chapters):
+                chapter_queue.append((local_order, chapter_idx, chapter_title, chapter_text))
         elif chapter_segments:
             self._console_log(
                 "[Generation] Chapter segmentation list is empty; falling back to full text."
             )
 
-        def _stream_chapter_segments(local_order, chapter_idx, chapter_title, chapter_text):
-            nonlocal segments_count
-
-            tokens_start = time.perf_counter()
-            chapter_tokens = self.tokenizer.tokenize(chapter_text)
-            tokens_elapsed = time.perf_counter() - tokens_start
-            self._console_log(
-                f"[Generation] Chapter {local_order + 1}/{active_chapter_count} "
-                f"'{chapter_title}' tokenized into {len(chapter_tokens)} tokens in {tokens_elapsed:.2f}s."
-            )
-
-            split_start = time.perf_counter()
-            split_segments = self.tokenizer.split_segments(
-                chapter_tokens,
-                max_text_tokens_per_segment=max_text_tokens_per_segment,
-            )
-            split_elapsed = time.perf_counter() - split_start
-            segment_total = len(split_segments)
-            self._console_log(
-                f"[Generation] Chapter '{chapter_title}' prepared {segment_total} segment"
-                f"{'s' if segment_total != 1 else ''} in {split_elapsed:.2f}s."
-            )
-
-            segments_count += segment_total
-            for local_segment_index, segment_tokens in enumerate(split_segments):
-                yield segment_tokens, {
-                    "chapter_index": chapter_idx,
-                    "chapter_title": chapter_title,
-                    "chapter_number": local_order + 1,
-                    "chapters_total": active_chapter_count,
-                    "chapter_segment_index": local_segment_index + 1,
-                    "chapter_segment_total": segment_total,
-                    "segments_total_snapshot": segments_count,
-                }
-
         def segment_iterator():
             nonlocal segments_count, text_tokens_list
 
             if sequential_chapter_mode:
-                for local_order, (chapter_idx, chapter_title, chapter_text) in enumerate(sanitized_chapters):
-                    yield from _stream_chapter_segments(
-                        local_order, chapter_idx, chapter_title, chapter_text
+                while chapter_queue:
+                    (
+                        local_order,
+                        chapter_idx,
+                        chapter_title,
+                        chapter_text,
+                    ) = chapter_queue[0]
+
+                    if not chapter_text:
+                        chapter_queue.popleft()
+                        continue
+
+                    tokens_start = time.perf_counter()
+                    chapter_tokens = self.tokenizer.tokenize(chapter_text)
+                    tokens_elapsed = time.perf_counter() - tokens_start
+                    self._console_log(
+                        f"[Generation] Chapter {local_order + 1}/{active_chapter_count} "
+                        f"'{chapter_title}' tokenized into {len(chapter_tokens)} tokens in {tokens_elapsed:.2f}s."
                     )
+                return
+
+                    split_start = time.perf_counter()
+                    split_segments = self.tokenizer.split_segments(
+                        chapter_tokens,
+                        max_text_tokens_per_segment=max_text_tokens_per_segment,
+                    )
+                    split_elapsed = time.perf_counter() - split_start
+                    segment_total = len(split_segments)
+                    self._console_log(
+                        f"[Generation] Chapter '{chapter_title}' prepared {segment_total} segment"
+                        f"{'s' if segment_total != 1 else ''} in {split_elapsed:.2f}s."
+                    )
+
+                    if segment_total == 0:
+                        chapter_queue.popleft()
+                        continue
+
+                    segments_count += segment_total
+                    for local_segment_index, segment_tokens in enumerate(split_segments):
+                        yield segment_tokens, {
+                            "chapter_index": chapter_idx,
+                            "chapter_title": chapter_title,
+                            "chapter_number": local_order + 1,
+                            "chapters_total": active_chapter_count,
+                            "chapter_segment_index": local_segment_index + 1,
+                            "chapter_segment_total": segment_total,
+                            "segments_total_snapshot": segments_count,
+                        }
+
+                    chapter_queue.popleft()
                 return
 
             text_tokens_list = self.tokenizer.tokenize(text)
@@ -744,7 +759,8 @@ class IndexTTS2:
                     "segments_total_snapshot": segments_count,
                 }
 
-        segments_iter = segment_iterator()
+            sequential_chapter_results.append(chapter_entry)
+            chapter_wavs.clear()
 
         sequential_chapter_results = []
         chapter_wavs = []
@@ -772,9 +788,16 @@ class IndexTTS2:
             chapter_wavs.clear()
 
         def _finalize_current_chapter():
-            nonlocal chapter_wavs, total_wav_samples, sequential_chapter_results, current_chapter_segment_processed
+            nonlocal chapter_wavs, total_wav_samples, sequential_chapter_results
+            nonlocal current_chapter_number, current_chapter_title
+            nonlocal current_chapter_segment_total, current_chapter_segment_processed
             if not chapter_wavs:
                 return
+
+            chapter_number = current_chapter_number or 1
+            chapter_title = current_chapter_title or "Chapter"
+            segment_total = current_chapter_segment_total
+            processed_segments = current_chapter_segment_processed
 
             inserted = self.insert_interval_silence(
                 chapter_wavs,
@@ -786,21 +809,21 @@ class IndexTTS2:
             chapter_length = chapter_tensor.shape[-1] / sampling_rate
             total_wav_samples += chapter_tensor.shape[-1]
 
-            segment_desc = f"{current_chapter_segment_processed} segment"
-            if current_chapter_segment_processed != 1:
+            segment_desc = f"{processed_segments} segment"
+            if processed_segments != 1:
                 segment_desc += "s"
-            if current_chapter_segment_total and current_chapter_segment_total != current_chapter_segment_processed:
-                segment_desc += f" out of {current_chapter_segment_total}"
+            if segment_total and segment_total != processed_segments:
+                segment_desc += f" out of {segment_total}"
 
             self._console_log(
-                f"[Generation] Chapter {current_chapter_number}/{active_chapter_count} "
-                f"'{current_chapter_title}' completed in {chapter_length:.2f}s with {segment_desc}."
+                f"[Generation] Chapter {chapter_number}/{active_chapter_count} "
+                f"'{chapter_title}' completed in {chapter_length:.2f}s with {segment_desc}."
             )
 
             chapter_entry = {
-                "number": current_chapter_number,
-                "title": current_chapter_title,
-                "segments": current_chapter_segment_processed,
+                "number": chapter_number,
+                "title": chapter_title,
+                "segments": processed_segments,
                 "duration": chapter_length,
             }
 
@@ -809,7 +832,7 @@ class IndexTTS2:
             if output_path:
                 base_root, base_ext = os.path.splitext(output_path)
                 if active_chapter_count > 1:
-                    chapter_path = f"{base_root}{_chapter_suffix(current_chapter_number, current_chapter_title)}{base_ext}"
+                    chapter_path = f"{base_root}{_chapter_suffix(chapter_number, chapter_title)}{base_ext}"
                 else:
                     chapter_path = output_path
 
@@ -828,6 +851,10 @@ class IndexTTS2:
 
             sequential_chapter_results.append(chapter_entry)
             chapter_wavs.clear()
+            current_chapter_number = None
+            current_chapter_title = None
+            current_chapter_segment_total = None
+            current_chapter_segment_processed = 0
 
         if verbose:
             if text_tokens_list is not None:
@@ -900,7 +927,7 @@ class IndexTTS2:
                 chapter_number = segment_metadata.get("chapter_number") or 1
                 if current_chapter_number is None:
                     _begin_new_chapter(segment_metadata)
-                elif chapter_number != current_chapter_number:
+                elif chapter_number != current_chapter_number and chapter_wavs:
                     _finalize_current_chapter()
                     _begin_new_chapter(segment_metadata)
                 current_chapter_segment_processed += 1
@@ -1095,6 +1122,12 @@ class IndexTTS2:
                     chapter_wavs.append(wav_cpu)
                 else:
                     wavs.append(wav_cpu)
+
+                if sequential_chapter_mode and active_chapter_count:
+                    total_segments = segment_metadata.get("chapter_segment_total")
+                    current_index = segment_metadata.get("chapter_segment_index")
+                    if total_segments and current_index and current_index >= total_segments:
+                        _finalize_current_chapter()
 
             segments_processed += 1
             now = time.perf_counter()
