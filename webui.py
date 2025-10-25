@@ -1099,7 +1099,9 @@ def compute_chapter_preview_data(text, regex_pattern):
         return [], "No chapters matched the provided regex.", [], False
 
     table_rows = build_chapter_table(matches, len(sanitized_text))
-    return matches, "" if feedback_enabled else "", table_rows, feedback_enabled
+    table_visible = True
+    status_message = ""
+    return matches, status_message, table_rows, table_visible
 
 def extract_audio_from_media(media_path, output_path=None, sample_rate=24000):
     """Extract audio from video/audio file and convert to acceptable format using FFmpeg."""
