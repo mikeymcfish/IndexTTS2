@@ -2487,6 +2487,63 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                     f"[{log_prefix}] Using chapter segmentation with {len(active_chunks)} chapter(s)"
                 )
 
+            if active_chapter_mode:
+                console_log(
+                    f"[{log_prefix}] Sequential chapter mode defers tokenization until synthesis."
+                )
+                sequential_preview_rows = []
+                for chunk_idx, chunk in enumerate(active_chunks):
+                    chapter_title = chunk.get("title") or f"Chapter {chunk_idx + 1}"
+                    chapter_text = (chunk.get("text") or "").strip()
+                    snippet = chapter_text.replace("\n", " ")
+                    max_preview_chars = 160
+                    if len(snippet) > max_preview_chars:
+                        snippet = f"{snippet[:max_preview_chars].rstrip()}…"
+                    if not snippet:
+                        snippet = "(Empty chapter)"
+                    sequential_preview_rows.append([
+                        chunk_idx,
+                        f"[{chapter_title}] {snippet}",
+                        "Deferred (queued)",
+                    ])
+                    progress(
+                        0.05 + 0.85 * (chunk_idx + 1) / len(active_chunks),
+                        desc=f"Queued chapter {chunk_idx + 1}/{len(active_chunks)}",
+                    )
+
+                state_value = {
+                    "text": sanitized_text,
+                    "max_tokens": max_tokens,
+                    "segments": [],
+                    "mode": preview_mode,
+                    "processed_at": time.perf_counter(),
+                    "chapter_mode": True,
+                    "chapter_signature": chapter_signature,
+                    "chapters": [
+                        {
+                            "title": chunk.get("title"),
+                            "start": chunk.get("start"),
+                            "end": chunk.get("end"),
+                            "text": chunk.get("text"),
+                        }
+                        for chunk in active_chunks
+                    ],
+                    "total_tokens": None,
+                    "total_segments": None,
+                    "sequential_preview": True,
+                }
+
+                progress(1.0, desc="Preview ready (sequential)")
+                token_message = (
+                    "📊 Sequential chapter processing enabled. Tokenization and segmentation occur per chapter during synthesis."
+                )
+                yield {
+                    segments_preview: gr.update(value=sequential_preview_rows, visible=True, type="array"),
+                    processed_segments_state: state_value,
+                    token_analysis: gr.update(value=token_message, visible=True),
+                }
+                return
+
             chapter_results = []
             total_tokens = 0
             total_segments = 0
