@@ -58,5 +58,8 @@ WeTextProcessing; sys_platform == 'linux'
 # Optional: WebUI support
 gradio==5.45.0
 
-# Optional: DeepSpeed support  
+# Optional: Vocal isolation support
+demucs==4.0.1
+
+# Optional: DeepSpeed support
 # deepspeed==0.17.1
