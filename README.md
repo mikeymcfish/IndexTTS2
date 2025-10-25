@@ -95,7 +95,7 @@ The Extras workflows depend on optional packages that are not required for core 
 | MP3 chapter editing | `pydub`, `mutagen` | `pip install pydub mutagen` |
 | VoiceForge OCR helpers | `deepseek-ocr` | `pip install deepseek-ocr` |
 
-If you encounter warnings about a missing module (for example `The 'demucs' package is required for vocal isolation` or `The 'deepseek-ocr' package is not installed`), install the listed packages inside the same Python environment where you run `python webui.py` or the VoiceForge tooling. Cloning the repository is sufficient—you do **not** need to fetch any additional projects beyond installing the required Python packages.
+If you encounter warnings about a missing module (for example `The 'demucs' package is required for vocal isolation` or `The 'deepseek-ocr' package is not installed`), install the listed packages inside the same Python environment where you run `python webui.py` or the VoiceForge tooling. Cloning the repository is sufficient—you do **not** need to fetch any additional projects beyond installing the required Python packages. Running `pip install deepseek-ocr` downloads the published wheel from PyPI, so there is no separate Git checkout or manual requirements step needed for the OCR helper.
 
 ### Command line synthesis
 Use the packaged CLI to synthesize speech directly from the terminal. The command below clones the voice in `examples/voice_01.wav` and saves the result to `gen.wav` (overwriting the file when `--force` is present).
