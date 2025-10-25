@@ -1,3 +1,4 @@
+import itertools
 import os
 from subprocess import CalledProcessError
 
@@ -660,86 +661,103 @@ class IndexTTS2:
             emo_cond_emb = self.cache_emo_cond
 
         self._set_gr_progress(0.1, "text processing...")
-        segments = []
         chapter_segment_mapping = []
         active_chapter_count = 0
         text_tokens_list = None
+        segments_count = 0
+        sequential_chapter_mode = False
 
-        if chapter_segments:
-            sanitized_chapters = []
-            for idx, chapter in enumerate(chapter_segments):
-                if not isinstance(chapter, dict):
-                    continue
-                chapter_text = chapter.get("text") or ""
-                chapter_title = chapter.get("title") or f"Chapter {idx + 1}"
-                if not chapter_text.strip():
-                    continue
-                sanitized_chapters.append((idx, chapter_title, chapter_text))
+        def segment_iterator():
+            nonlocal segments_count, active_chapter_count, text_tokens_list, sequential_chapter_mode
 
-            active_chapter_count = len(sanitized_chapters)
-            if sanitized_chapters:
-                self._console_log(
-                    f"[Generation] Chapter segmentation enabled for {active_chapter_count} chapter"
-                    f"{'s' if active_chapter_count != 1 else ''}."
-                )
+            if chapter_segments:
+                sanitized_chapters = []
+                for idx, chapter in enumerate(chapter_segments):
+                    if not isinstance(chapter, dict):
+                        continue
+                    chapter_text = chapter.get("text") or ""
+                    chapter_title = chapter.get("title") or f"Chapter {idx + 1}"
+                    if not chapter_text.strip():
+                        continue
+                    sanitized_chapters.append((idx, chapter_title, chapter_text))
 
-                for local_order, (chapter_idx, chapter_title, chapter_text) in enumerate(sanitized_chapters):
-                    tokens_start = time.perf_counter()
-                    chapter_tokens = self.tokenizer.tokenize(chapter_text)
-                    tokens_elapsed = time.perf_counter() - tokens_start
+                active_chapter_count = len(sanitized_chapters)
+                if sanitized_chapters:
+                    sequential_chapter_mode = True
                     self._console_log(
-                        f"[Generation] Chapter {local_order + 1}/{active_chapter_count} "
-                        f"'{chapter_title}' tokenized into {len(chapter_tokens)} tokens in {tokens_elapsed:.2f}s."
+                        f"[Generation] Chapter segmentation enabled for {active_chapter_count} chapter"
+                        f"{'s' if active_chapter_count != 1 else ''}; synthesizing sequentially."
                     )
 
-                    split_start = time.perf_counter()
-                    split_segments = self.tokenizer.split_segments(
-                        chapter_tokens,
-                        max_text_tokens_per_segment=max_text_tokens_per_segment,
-                    )
-                    split_elapsed = time.perf_counter() - split_start
+                    for local_order, (chapter_idx, chapter_title, chapter_text) in enumerate(sanitized_chapters):
+                        tokens_start = time.perf_counter()
+                        chapter_tokens = self.tokenizer.tokenize(chapter_text)
+                        tokens_elapsed = time.perf_counter() - tokens_start
+                        self._console_log(
+                            f"[Generation] Chapter {local_order + 1}/{active_chapter_count} "
+                            f"'{chapter_title}' tokenized into {len(chapter_tokens)} tokens in {tokens_elapsed:.2f}s."
+                        )
+
+                        split_start = time.perf_counter()
+                        split_segments = self.tokenizer.split_segments(
+                            chapter_tokens,
+                            max_text_tokens_per_segment=max_text_tokens_per_segment,
+                        )
+                        split_elapsed = time.perf_counter() - split_start
+                        segment_total = len(split_segments)
+                        self._console_log(
+                            f"[Generation] Chapter '{chapter_title}' prepared {segment_total} segment"
+                            f"{'s' if segment_total != 1 else ''} in {split_elapsed:.2f}s."
+                        )
+                        segments_count += segment_total
+                        for local_segment_index, segment_tokens in enumerate(split_segments):
+                            chapter_segment_mapping.append({
+                                "chapter_index": chapter_idx,
+                                "chapter_title": chapter_title,
+                            })
+                            yield segment_tokens, {
+                                "chapter_index": chapter_idx,
+                                "chapter_title": chapter_title,
+                                "chapter_number": local_order + 1,
+                                "chapters_total": active_chapter_count,
+                                "chapter_segment_index": local_segment_index + 1,
+                                "chapter_segment_total": segment_total,
+                                "segments_total_snapshot": segments_count,
+                            }
+                else:
                     self._console_log(
-                        f"[Generation] Chapter '{chapter_title}' prepared {len(split_segments)} segment"
-                        f"{'s' if len(split_segments) != 1 else ''} in {split_elapsed:.2f}s."
+                        "[Generation] Chapter segmentation list is empty; falling back to full text."
                     )
-                    for segment_tokens in split_segments:
-                        segments.append(segment_tokens)
-                        chapter_segment_mapping.append({
-                            "chapter_index": chapter_idx,
-                            "chapter_title": chapter_title,
-                        })
+                    text_tokens_list = self.tokenizer.tokenize(text)
+                    base_segments = self.tokenizer.split_segments(
+                        text_tokens_list, max_text_tokens_per_segment
+                    )
+                    segments_count = len(base_segments)
+                    for segment_tokens in base_segments:
+                        yield segment_tokens, {
+                            "segments_total_snapshot": segments_count,
+                        }
             else:
-                self._console_log("[Generation] Chapter segmentation list is empty; falling back to full text.")
                 text_tokens_list = self.tokenizer.tokenize(text)
-                segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
-        else:
-            text_tokens_list = self.tokenizer.tokenize(text)
-            segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
+                base_segments = self.tokenizer.split_segments(
+                    text_tokens_list, max_text_tokens_per_segment
+                )
+                segments_count = len(base_segments)
+                for segment_tokens in base_segments:
+                    yield segment_tokens, {
+                        "segments_total_snapshot": segments_count,
+                    }
 
-        segments_count = len(segments)
-        if segments_count:
-            if chapter_segment_mapping:
-                self._console_log(
-                    f"[Generation] Starting synthesis for {segments_count} segment"
-                    f"{'s' if segments_count != 1 else ''} across {active_chapter_count} chapter"
-                    f"{'s' if active_chapter_count != 1 else ''}."
-                )
-            else:
-                self._console_log(
-                    f"[Generation] Starting synthesis for {segments_count} segment"
-                    f"{'s' if segments_count != 1 else ''}."
-                )
-        else:
-            self._console_log("[Generation] No segments found; nothing to synthesize.")
+        segments_iter = segment_iterator()
 
         if verbose:
             if text_tokens_list is not None:
                 print("text_tokens_list:", text_tokens_list)
+                print("segments count:", segments_count)
+                print("max_text_tokens_per_segment:", max_text_tokens_per_segment)
             else:
-                print("chapter segmentation active; tokens collected per chapter")
-            print("segments count:", segments_count)
-            print("max_text_tokens_per_segment:", max_text_tokens_per_segment)
-            print(*segments, sep="\n")
+                print("chapter segmentation active; segments streamed sequentially per chapter")
+                print("max_text_tokens_per_segment:", max_text_tokens_per_segment)
         do_sample = generation_kwargs.pop("do_sample", True)
         top_p = generation_kwargs.pop("top_p", 0.8)
         top_k = generation_kwargs.pop("top_k", 30)
@@ -751,6 +769,18 @@ class IndexTTS2:
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
         sampling_rate = 22050
 
+
+        try:
+            first_segment = next(segments_iter)
+        except StopIteration:
+            first_segment = None
+
+        if first_segment is None:
+            self._console_log("[Generation] No segments found; nothing to synthesize.")
+            return None
+
+        segment_stream = itertools.chain([first_segment], segments_iter)
+
         wavs = []
         gpt_gen_time = 0
         gpt_forward_time = 0
@@ -758,23 +788,61 @@ class IndexTTS2:
         bigvgan_time = 0
         has_warned = False
         synthesis_start = time.perf_counter()
-        for seg_idx, sent in enumerate(segments):
-            segment_start_time = time.perf_counter()
-            self._set_gr_progress(0.2 + 0.7 * seg_idx / segments_count,
-                                  f"speech synthesis {seg_idx + 1}/{segments_count}...")
+        segments_processed = 0
+        synthesis_logged = False
 
-            text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
+        for segment_tokens, segment_metadata in segment_stream:
+            segments_total_snapshot = max(
+                segment_metadata.get("segments_total_snapshot", segments_count),
+                segments_processed + 1,
+            )
+
+            if not synthesis_logged:
+                if sequential_chapter_mode and active_chapter_count:
+                    chapter_number = segment_metadata.get("chapter_number", 1)
+                    chapter_title = segment_metadata.get("chapter_title") or "Chapter"
+                    segment_total = segment_metadata.get(
+                        "chapter_segment_total",
+                        segments_total_snapshot,
+                    )
+                    self._console_log(
+                        f"[Generation] Starting sequential synthesis for chapter {chapter_number}/"
+                        f"{active_chapter_count} '{chapter_title}' with {segment_total} segment"
+                        f"{'s' if segment_total != 1 else ''}."
+                    )
+                else:
+                    self._console_log(
+                        f"[Generation] Starting synthesis for {segments_total_snapshot} segment"
+                        f"{'s' if segments_total_snapshot != 1 else ''}."
+                    )
+                synthesis_logged = True
+
+            progress_denominator = max(segments_total_snapshot, 1)
+            next_segment_index = segments_processed + 1
+            progress_message = f"speech synthesis {next_segment_index}/{progress_denominator}"
+            if sequential_chapter_mode and active_chapter_count:
+                chapter_number = segment_metadata.get("chapter_number")
+                chapters_total = segment_metadata.get("chapters_total", active_chapter_count)
+                if chapter_number is not None and chapters_total:
+                    progress_message += f" (chapter {chapter_number}/{chapters_total})"
+            progress_message += "..."
+            self._set_gr_progress(
+                0.2 + 0.7 * segments_processed / progress_denominator,
+                progress_message,
+            )
+
+            segment_start_time = time.perf_counter()
+
+            text_tokens = self.tokenizer.convert_tokens_to_ids(segment_tokens)
             text_tokens = torch.tensor(text_tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
             if verbose:
                 print(text_tokens)
                 print(f"text_tokens shape: {text_tokens.shape}, text_tokens type: {text_tokens.dtype}")
-                # debug tokenizer
                 text_token_syms = self.tokenizer.convert_ids_to_tokens(text_tokens[0].tolist())
-                print("text_token_syms is same as segment tokens", text_token_syms == sent)
+                print("text_token_syms is same as segment tokens", text_token_syms == segment_tokens)
 
             m_start_time = time.perf_counter()
             with torch.no_grad():
-                # In hybrid mode, move GPT to device before using it
                 if self.hybrid_model_device:
                     self.gpt = self.gpt.to(self.device)
                     print(">> [Hybrid] GPT moved to device for inference")
@@ -790,7 +858,6 @@ class IndexTTS2:
 
                     if emo_vector is not None:
                         emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
-                        # emovec = emovec_mat
 
                     codes, speech_conditioning_latent = self.gpt.inference_speech(
                         spk_cond_emb,
@@ -811,17 +878,13 @@ class IndexTTS2:
                         **generation_kwargs
                     )
 
-                    # Optionally reset generation cache to prevent VRAM accumulation across segments
                     if reset_beam_cache_per_segment:
                         try:
                             inf = self.gpt.inference_model
                             if hasattr(inf, "_cache") and inf._cache is not None:
-                                # Reset HF dynamic cache
                                 inf._cache.reset()
-                            # Also drop any stored mel embeddings
                             if hasattr(inf, "cached_mel_emb"):
                                 inf.cached_mel_emb = None
-                            # Free CUDA cache to reclaim fragmented memory
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
                         except Exception as _:
@@ -837,12 +900,6 @@ class IndexTTS2:
                     )
                     has_warned = True
 
-                code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=codes.dtype)
-                #                 if verbose:
-                #                     print(codes, type(codes))
-                #                     print(f"codes shape: {codes.shape}, codes type: {codes.dtype}")
-                #                     print(f"code len: {code_lens}")
-
                 code_lens = []
                 for code in codes:
                     if self.stop_mel_token not in code:
@@ -856,9 +913,12 @@ class IndexTTS2:
                 code_lens = torch.LongTensor(code_lens)
                 code_lens = code_lens.to(self.device)
 
-                # Optional: Remove long consecutive silences (if max_consecutive_silence > 0)
                 if max_consecutive_silence > 0:
-                    codes, code_lens = self.remove_long_silence(codes, silent_token=52, max_consecutive=max_consecutive_silence)
+                    codes, code_lens = self.remove_long_silence(
+                        codes,
+                        silent_token=52,
+                        max_consecutive=max_consecutive_silence,
+                    )
                     if verbose:
                         print(f"Applied silence removal with max_consecutive={max_consecutive_silence}")
 
@@ -884,7 +944,6 @@ class IndexTTS2:
                     )
                     gpt_forward_time += time.perf_counter() - m_start_time
 
-                    # Move GPT back to CPU after use in hybrid mode
                     if self.hybrid_model_device:
                         self.gpt = self.gpt.to(self.cpu_device)
                         self._clear_memory_cache()
@@ -893,15 +952,12 @@ class IndexTTS2:
                 dtype = None
                 with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
                     m_start_time = time.perf_counter()
-                    # diffusion_steps and inference_cfg_rate now passed as parameters
 
-                    # Move s2mel and semantic_codec to device in hybrid mode
                     if self.hybrid_model_device:
                         self.s2mel = self.s2mel.to(self.device)
                         self.semantic_codec = self.semantic_codec.to(self.device)
                         print(">> [Hybrid] S2Mel and semantic_codec moved to device")
 
-                    # Update CFM cache if needed (only if different from current setting)
                     if hasattr(self.s2mel.models['cfm'].estimator, '_cached_seq_length'):
                         if self.s2mel.models['cfm'].estimator._cached_seq_length != cfm_cache_length:
                             self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=cfm_cache_length)
@@ -925,7 +981,6 @@ class IndexTTS2:
                     vc_target = vc_target[:, :, ref_mel.size(-1):]
                     s2mel_time += time.perf_counter() - m_start_time
 
-                    # Move s2mel and semantic_codec back to CPU, move BigVGAN to device in hybrid mode
                     if self.hybrid_model_device:
                         self.s2mel = self.s2mel.to(self.cpu_device)
                         self.semantic_codec = self.semantic_codec.to(self.cpu_device)
@@ -938,7 +993,6 @@ class IndexTTS2:
                     print(wav.shape)
                     bigvgan_time += time.perf_counter() - m_start_time
 
-                    # Move BigVGAN back to CPU in hybrid mode
                     if self.hybrid_model_device:
                         self.bigvgan = self.bigvgan.to(self.cpu_device)
                         self._clear_memory_cache()
@@ -948,35 +1002,55 @@ class IndexTTS2:
                 wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
                 if verbose:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-                # wavs.append(wav[:, :-512])
-                wavs.append(wav.cpu())  # to cpu before saving
+                wavs.append(wav.cpu())
 
+            segments_processed += 1
             now = time.perf_counter()
-            processed_segments = seg_idx + 1
-            remaining_segments = max(segments_count - processed_segments, 0)
             elapsed_since_start = now - synthesis_start
             segment_elapsed = now - segment_start_time
+
+            total_snapshot = max(segments_total_snapshot, segments_processed)
+            remaining_segments_known = max(total_snapshot - segments_processed, 0)
+
             chapter_suffix = ""
-            if chapter_segment_mapping:
-                mapping = chapter_segment_mapping[min(seg_idx, len(chapter_segment_mapping) - 1)]
-                chapter_idx = mapping.get("chapter_index")
-                chapter_title = mapping.get("chapter_title") or (f"Chapter {chapter_idx + 1}" if chapter_idx is not None else "Chapter")
-                if chapter_title and len(chapter_title) > 60:
-                    chapter_title = chapter_title[:57] + "..."
+            chapter_idx = segment_metadata.get("chapter_index")
+            chapter_title = segment_metadata.get("chapter_title")
+            if chapter_title:
+                display_title = chapter_title if len(chapter_title) <= 60 else chapter_title[:57] + "..."
                 if chapter_idx is not None:
-                    chapter_suffix = f" [Chapter {chapter_idx + 1}: {chapter_title}]"
+                    chapter_suffix = f" [Chapter {chapter_idx + 1}: {display_title}]"
                 else:
-                    chapter_suffix = f" [Chapter: {chapter_title}]"
-            if processed_segments > 0 and remaining_segments > 0:
-                avg_time = elapsed_since_start / processed_segments
-                eta_seconds = avg_time * remaining_segments
+                    chapter_suffix = f" [Chapter: {display_title}]"
+
+            pending_chapters = 0
+            if sequential_chapter_mode and active_chapter_count:
+                chapter_number = segment_metadata.get("chapter_number") or 0
+                chapters_total = segment_metadata.get("chapters_total", active_chapter_count) or 0
+                pending_chapters = max(chapters_total - chapter_number, 0)
+
+            if segments_processed > 0 and remaining_segments_known > 0:
+                avg_time = elapsed_since_start / segments_processed
+                eta_seconds = avg_time * remaining_segments_known
                 eta_str = f"{eta_seconds:.1f}s"
+            elif sequential_chapter_mode and pending_chapters > 0:
+                eta_str = "pending chapters"
             else:
                 eta_str = "0.0s"
+
+            pending_note = ""
+            if sequential_chapter_mode and pending_chapters > 0:
+                pending_note = (
+                    f", {pending_chapters} chapter"
+                    f"{'s' if pending_chapters != 1 else ''} awaiting segmentation"
+                )
+
             self._console_log(
-                f"[Generation] Finished segment {processed_segments}/{segments_count}{chapter_suffix} in {segment_elapsed:.2f}s "
-                f"({elapsed_since_start:.1f}s elapsed, {remaining_segments} remaining, ETA {eta_str})."
+                f"[Generation] Finished segment {segments_processed}/{total_snapshot}{chapter_suffix} "
+                f"in {segment_elapsed:.2f}s ({elapsed_since_start:.1f}s elapsed, "
+                f"{remaining_segments_known} remaining{pending_note}, ETA {eta_str})."
             )
+
+        segments_count = max(segments_count, segments_processed)
         end_time = time.perf_counter()
         synthesis_elapsed = end_time - synthesis_start
         if segments_count:
