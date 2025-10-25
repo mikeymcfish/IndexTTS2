@@ -661,92 +661,88 @@ class IndexTTS2:
             emo_cond_emb = self.cache_emo_cond
 
         self._set_gr_progress(0.1, "text processing...")
-        chapter_segment_mapping = []
-        active_chapter_count = 0
         text_tokens_list = None
         segments_count = 0
         sequential_chapter_mode = False
+        active_chapter_count = 0
+
+        sanitized_chapters = []
+        if chapter_segments:
+            for idx, chapter in enumerate(chapter_segments):
+                if not isinstance(chapter, dict):
+                    continue
+                chapter_text = chapter.get("text") or ""
+                chapter_title = chapter.get("title") or f"Chapter {idx + 1}"
+                if not chapter_text.strip():
+                    continue
+                sanitized_chapters.append((idx, chapter_title, chapter_text))
+
+        if sanitized_chapters:
+            active_chapter_count = len(sanitized_chapters)
+            sequential_chapter_mode = True
+            self._console_log(
+                f"[Generation] Chapter segmentation enabled for {active_chapter_count} chapter"
+                f"{'s' if active_chapter_count != 1 else ''}; synthesizing sequentially."
+            )
+        elif chapter_segments:
+            self._console_log(
+                "[Generation] Chapter segmentation list is empty; falling back to full text."
+            )
+
+        def _stream_chapter_segments(local_order, chapter_idx, chapter_title, chapter_text):
+            nonlocal segments_count
+
+            tokens_start = time.perf_counter()
+            chapter_tokens = self.tokenizer.tokenize(chapter_text)
+            tokens_elapsed = time.perf_counter() - tokens_start
+            self._console_log(
+                f"[Generation] Chapter {local_order + 1}/{active_chapter_count} "
+                f"'{chapter_title}' tokenized into {len(chapter_tokens)} tokens in {tokens_elapsed:.2f}s."
+            )
+
+            split_start = time.perf_counter()
+            split_segments = self.tokenizer.split_segments(
+                chapter_tokens,
+                max_text_tokens_per_segment=max_text_tokens_per_segment,
+            )
+            split_elapsed = time.perf_counter() - split_start
+            segment_total = len(split_segments)
+            self._console_log(
+                f"[Generation] Chapter '{chapter_title}' prepared {segment_total} segment"
+                f"{'s' if segment_total != 1 else ''} in {split_elapsed:.2f}s."
+            )
+
+            segments_count += segment_total
+            for local_segment_index, segment_tokens in enumerate(split_segments):
+                yield segment_tokens, {
+                    "chapter_index": chapter_idx,
+                    "chapter_title": chapter_title,
+                    "chapter_number": local_order + 1,
+                    "chapters_total": active_chapter_count,
+                    "chapter_segment_index": local_segment_index + 1,
+                    "chapter_segment_total": segment_total,
+                    "segments_total_snapshot": segments_count,
+                }
 
         def segment_iterator():
-            nonlocal segments_count, active_chapter_count, text_tokens_list, sequential_chapter_mode
+            nonlocal segments_count, text_tokens_list
 
-            if chapter_segments:
-                sanitized_chapters = []
-                for idx, chapter in enumerate(chapter_segments):
-                    if not isinstance(chapter, dict):
-                        continue
-                    chapter_text = chapter.get("text") or ""
-                    chapter_title = chapter.get("title") or f"Chapter {idx + 1}"
-                    if not chapter_text.strip():
-                        continue
-                    sanitized_chapters.append((idx, chapter_title, chapter_text))
-
-                active_chapter_count = len(sanitized_chapters)
-                if sanitized_chapters:
-                    sequential_chapter_mode = True
-                    self._console_log(
-                        f"[Generation] Chapter segmentation enabled for {active_chapter_count} chapter"
-                        f"{'s' if active_chapter_count != 1 else ''}; synthesizing sequentially."
+            if sequential_chapter_mode:
+                for local_order, (chapter_idx, chapter_title, chapter_text) in enumerate(sanitized_chapters):
+                    yield from _stream_chapter_segments(
+                        local_order, chapter_idx, chapter_title, chapter_text
                     )
+                return
 
-                    for local_order, (chapter_idx, chapter_title, chapter_text) in enumerate(sanitized_chapters):
-                        tokens_start = time.perf_counter()
-                        chapter_tokens = self.tokenizer.tokenize(chapter_text)
-                        tokens_elapsed = time.perf_counter() - tokens_start
-                        self._console_log(
-                            f"[Generation] Chapter {local_order + 1}/{active_chapter_count} "
-                            f"'{chapter_title}' tokenized into {len(chapter_tokens)} tokens in {tokens_elapsed:.2f}s."
-                        )
-
-                        split_start = time.perf_counter()
-                        split_segments = self.tokenizer.split_segments(
-                            chapter_tokens,
-                            max_text_tokens_per_segment=max_text_tokens_per_segment,
-                        )
-                        split_elapsed = time.perf_counter() - split_start
-                        segment_total = len(split_segments)
-                        self._console_log(
-                            f"[Generation] Chapter '{chapter_title}' prepared {segment_total} segment"
-                            f"{'s' if segment_total != 1 else ''} in {split_elapsed:.2f}s."
-                        )
-                        segments_count += segment_total
-                        for local_segment_index, segment_tokens in enumerate(split_segments):
-                            chapter_segment_mapping.append({
-                                "chapter_index": chapter_idx,
-                                "chapter_title": chapter_title,
-                            })
-                            yield segment_tokens, {
-                                "chapter_index": chapter_idx,
-                                "chapter_title": chapter_title,
-                                "chapter_number": local_order + 1,
-                                "chapters_total": active_chapter_count,
-                                "chapter_segment_index": local_segment_index + 1,
-                                "chapter_segment_total": segment_total,
-                                "segments_total_snapshot": segments_count,
-                            }
-                else:
-                    self._console_log(
-                        "[Generation] Chapter segmentation list is empty; falling back to full text."
-                    )
-                    text_tokens_list = self.tokenizer.tokenize(text)
-                    base_segments = self.tokenizer.split_segments(
-                        text_tokens_list, max_text_tokens_per_segment
-                    )
-                    segments_count = len(base_segments)
-                    for segment_tokens in base_segments:
-                        yield segment_tokens, {
-                            "segments_total_snapshot": segments_count,
-                        }
-            else:
-                text_tokens_list = self.tokenizer.tokenize(text)
-                base_segments = self.tokenizer.split_segments(
-                    text_tokens_list, max_text_tokens_per_segment
-                )
-                segments_count = len(base_segments)
-                for segment_tokens in base_segments:
-                    yield segment_tokens, {
-                        "segments_total_snapshot": segments_count,
-                    }
+            text_tokens_list = self.tokenizer.tokenize(text)
+            base_segments = self.tokenizer.split_segments(
+                text_tokens_list, max_text_tokens_per_segment
+            )
+            segments_count = len(base_segments)
+            for segment_tokens in base_segments:
+                yield segment_tokens, {
+                    "segments_total_snapshot": segments_count,
+                }
 
         segments_iter = segment_iterator()
 
