@@ -44,10 +44,8 @@ unset LD_LIBRARY_PATH
 cd /workspace/IndexTTS2
 export HF_HOME="/workspace"
 export PYTHONWARNINGS=ignore
-git fetch origin
-git reset --hard origin/main
 source ./venv/bin/activate
-python webui.py --share
+python webui.py --share --host 0.0.0.0 --port 7860
 
 To kill previously running app without restarting the machine run below command
 
