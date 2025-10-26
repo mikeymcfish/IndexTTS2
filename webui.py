@@ -705,7 +705,13 @@ def write_chapters_to_mp3(mp3_path, chapter_entries):
     return True, f"Wrote {len(element_ids)} chapter marker(s)."
 
 
-def merge_mp3_files(mp3_files, keep_existing_chapters=True, output_filename="", mp3_bitrate_value="256k"):
+def merge_mp3_files(
+    mp3_files,
+    keep_existing_chapters=True,
+    output_filename="",
+    mp3_bitrate_value="256k",
+    mp3_directory="",
+):
     """Merge multiple MP3 files into a single MP3 and manage chapter metadata."""
     if not MP3_AVAILABLE:
         return (
@@ -714,6 +720,7 @@ def merge_mp3_files(mp3_files, keep_existing_chapters=True, output_filename="", 
         )
 
     file_paths = []
+    invalid_directories = []
     if isinstance(mp3_files, list):
         for item in mp3_files:
             if isinstance(item, str) and item:
@@ -725,11 +732,69 @@ def merge_mp3_files(mp3_files, keep_existing_chapters=True, output_filename="", 
     elif isinstance(mp3_files, str) and mp3_files:
         file_paths.append(mp3_files)
 
-    file_paths = [path for path in file_paths if path and os.path.exists(path)]
+    directories = []
+    if isinstance(mp3_directory, str):
+        if mp3_directory.strip():
+            directories.append(mp3_directory.strip())
+    elif isinstance(mp3_directory, list):
+        directories.extend([d.strip() for d in mp3_directory if isinstance(d, str) and d.strip()])
+
+    for directory in directories:
+        expanded_directory = os.path.abspath(os.path.expanduser(directory))
+        if not os.path.isdir(expanded_directory):
+            invalid_directories.append(directory)
+            continue
+
+        directory_files = [
+            path
+            for path in sorted(
+                glob.glob(os.path.join(expanded_directory, "**", "*.mp3"), recursive=True)
+            )
+            if os.path.isfile(path)
+        ]
+
+        if directory_files:
+            file_paths.extend(directory_files)
+        else:
+            invalid_directories.append(directory)
+
+    normalized_paths = []
+    seen = set()
+    for path in file_paths:
+        if not path:
+            continue
+        absolute_path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isfile(absolute_path):
+            continue
+        if absolute_path in seen:
+            continue
+        seen.add(absolute_path)
+        normalized_paths.append(absolute_path)
+
+    file_paths = normalized_paths
+
+    if invalid_directories:
+        invalid_list = ", ".join(sorted(set(invalid_directories)))
+        return (
+            gr.update(
+                value=(
+                    "The following directories are invalid or contain no MP3 files: "
+                    f"{invalid_list}."
+                ),
+                visible=True,
+            ),
+            gr.update(value=None, visible=False),
+        )
 
     if len(file_paths) < 2:
         return (
-            gr.update(value="Please select at least two MP3 files to merge.", visible=True),
+            gr.update(
+                value=(
+                    "Please select at least two MP3 files to merge or provide a directory "
+                    "containing them."
+                ),
+                visible=True,
+            ),
             gr.update(value=None, visible=False),
         )
 
@@ -2143,6 +2208,10 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 file_count="multiple",
                 type="filepath",
             )
+            merge_mp3_directory = gr.Textbox(
+                label="Directory Containing MP3 Files (optional)",
+                placeholder="Provide a directory path to automatically load MP3 files",
+            )
             merge_keep_chapters = gr.Checkbox(
                 label="Keep chapters",
                 value=True,
@@ -3079,7 +3148,13 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
 
     merge_button.click(
         merge_mp3_files,
-        inputs=[merge_mp3_inputs, merge_keep_chapters, merge_output_name, mp3_bitrate],
+        inputs=[
+            merge_mp3_inputs,
+            merge_keep_chapters,
+            merge_output_name,
+            mp3_bitrate,
+            merge_mp3_directory,
+        ],
         outputs=[merge_status, merged_audio_preview],
     )
 
