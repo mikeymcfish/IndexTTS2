@@ -33,6 +33,9 @@ IndexTTS2 is the latest generation of the Index Team's zero-shot text-to-speech 
 - Python 3.10 or newer and an NVIDIA GPU with CUDA 12.8+ for accelerated inference (CPU execution is supported but significantly slower)
 
 ### 2. Clone the repository and fetch LFS assets
+If you have not already cloned the project, do so once and change into the repository directory. All subsequent commands assume
+they are executed from the root of the cloned repository.
+
 ```bash
 git clone https://github.com/index-tts/index-tts2.git
 cd index-tts2
