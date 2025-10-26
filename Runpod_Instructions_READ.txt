@@ -22,15 +22,15 @@ Add expose HTTP ports 7861 to connect via proxy if you want but i recommend Grad
 
 It will by defualt start with --share with gradio share as well
 
-Upload everything into workspace folder - you can upload zip file and extract it as well
+Upload the repository into the `/workspace` folder (for example, clone it once or upload a ZIP file and extract it).
 
-To install run below command
+To install, change into the `IndexTTS2` directory and run the commands below. The install script assumes it is being executed from the cloned repository.
 
 export HF_HOME="/workspace"
 chmod +x RunPod_Install.sh
 ./RunPod_Install.sh
 
-The install script will clone https://github.com/mikeymcfish/IndexTTS2, set up the Python virtual environment, install FFmpeg to the system PATH when needed, install all Python requirements, and download the required checkpoints into /workspace/IndexTTS2/checkpoints.
+The install script sets up the Python virtual environment, installs FFmpeg to the system PATH when needed, installs all Python requirements, and downloads the required checkpoints into /workspace/IndexTTS2/checkpoints.
 
 After running the app it will download few additional models
 

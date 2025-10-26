@@ -1,15 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO_URL="https://github.com/mikeymcfish/IndexTTS2.git"
-REPO_DIR="IndexTTS2"
+# Change into the repository root (the directory containing this script)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
 
-# Clone the repository if it is not already present
-if [ ! -d "${REPO_DIR}/.git" ]; then
-    git clone "${REPO_URL}" "${REPO_DIR}"
+if [ ! -d ".git" ]; then
+    echo "Error: RunPod_Install.sh must be executed from within a cloned IndexTTS2 repository." >&2
+    exit 1
 fi
-
-cd "${REPO_DIR}"
 
 git fetch origin
 DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
@@ -17,6 +16,7 @@ if [ -z "${DEFAULT_BRANCH}" ]; then
     DEFAULT_BRANCH="main"
 fi
 
+# Sync to the latest default branch when possible
 git checkout "${DEFAULT_BRANCH}"
 git reset --hard "origin/${DEFAULT_BRANCH}"
 
