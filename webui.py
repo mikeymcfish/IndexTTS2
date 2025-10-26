@@ -705,7 +705,256 @@ def write_chapters_to_mp3(mp3_path, chapter_entries):
     return True, f"Wrote {len(element_ids)} chapter marker(s)."
 
 
+def _parse_uploaded_mp3s(mp3_files):
+    """Normalize uploaded MP3 inputs into absolute file paths."""
+    paths = []
+    if isinstance(mp3_files, list):
+        for item in mp3_files:
+            if isinstance(item, str) and item:
+                paths.append(item)
+            elif isinstance(item, dict):
+                path = item.get("name") or item.get("path")
+                if path:
+                    paths.append(path)
+    elif isinstance(mp3_files, str) and mp3_files:
+        paths.append(mp3_files)
+
+    normalized = []
+    seen = set()
+    for path in paths:
+        if not path:
+            continue
+        absolute_path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isfile(absolute_path):
+            continue
+        if absolute_path in seen:
+            continue
+        seen.add(absolute_path)
+        normalized.append(absolute_path)
+
+    return normalized
+
+
+def _expand_mp3_directories(mp3_directory):
+    """Collect MP3 files from one or more directories."""
+    directories = []
+    if isinstance(mp3_directory, str):
+        pieces = re.split(r"[\n;,]", mp3_directory)
+        directories.extend([p.strip() for p in pieces if p and p.strip()])
+    elif isinstance(mp3_directory, list):
+        directories.extend([d.strip() for d in mp3_directory if isinstance(d, str) and d.strip()])
+
+    collected = []
+    invalid = []
+    for directory in directories:
+        expanded_directory = os.path.abspath(os.path.expanduser(directory))
+        if not os.path.isdir(expanded_directory):
+            invalid.append(directory)
+            continue
+
+        directory_files = [
+            path
+            for path in sorted(
+                glob.glob(os.path.join(expanded_directory, "**", "*.mp3"), recursive=True)
+            )
+            if os.path.isfile(path)
+        ]
+
+        if directory_files:
+            collected.extend(directory_files)
+        else:
+            invalid.append(directory)
+
+    normalized = []
+    seen = set()
+    for path in collected:
+        absolute_path = os.path.abspath(os.path.expanduser(path))
+        if absolute_path in seen:
+            continue
+        seen.add(absolute_path)
+        normalized.append(absolute_path)
+
+    return normalized, invalid
+
+
+def _format_merge_list_display(file_paths):
+    if not file_paths:
+        return (
+            "No MP3 files loaded yet. Use **Load MP3 List** after selecting files or providing "
+            "a directory to review and re-order tracks."
+        )
+
+    lines = []
+    for idx, path in enumerate(file_paths, start=1):
+        filename = html.escape(os.path.basename(path) or f"Track {idx}")
+        lines.append(f"{idx}. **{filename}**  \n   `{html.escape(path)}`")
+
+    return "\n".join(lines)
+
+
+def _merge_list_component_updates(file_paths, selected_path=None, status_message=""):
+    display_value = _format_merge_list_display(file_paths)
+    selected_value = selected_path if selected_path in file_paths else (file_paths[0] if file_paths else None)
+
+    dropdown_update = gr.update(
+        choices=file_paths,
+        value=selected_value,
+        interactive=bool(file_paths),
+    )
+
+    display_update = gr.update(value=display_value, visible=True)
+    status_update = gr.update(value=status_message, visible=bool(status_message))
+
+    return display_update, dropdown_update, status_update
+
+
+def load_merge_mp3_sources(mp3_files, mp3_directory, current_state, selected_track):
+    """Collect MP3 sources and merge them into the tracked ordering state."""
+    valid_state = []
+    seen = set()
+    if isinstance(current_state, list):
+        for path in current_state:
+            if not path:
+                continue
+            absolute_path = os.path.abspath(os.path.expanduser(path))
+            if not os.path.isfile(absolute_path):
+                continue
+            if absolute_path in seen:
+                continue
+            seen.add(absolute_path)
+            valid_state.append(absolute_path)
+
+    uploaded_paths = _parse_uploaded_mp3s(mp3_files)
+    for path in uploaded_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        valid_state.append(path)
+
+    directory_paths, invalid_directories = _expand_mp3_directories(mp3_directory)
+    for path in directory_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        valid_state.append(path)
+
+    status_message = ""
+    if invalid_directories:
+        invalid_list = ", ".join(sorted(set(invalid_directories)))
+        status_message = (
+            "The following directories are invalid or contain no MP3 files: "
+            f"{invalid_list}."
+        )
+    elif not valid_state:
+        status_message = "No MP3 files found. Add files or a directory, then load the list."
+
+    display_update, dropdown_update, status_update = _merge_list_component_updates(
+        valid_state,
+        selected_path=selected_track,
+        status_message=status_message,
+    )
+
+    return valid_state, display_update, dropdown_update, status_update
+
+
+def move_merge_track(current_state, selected_track, direction):
+    """Move the selected track up or down within the merge order."""
+    if not isinstance(current_state, list) or not current_state:
+        display_update, dropdown_update, status_update = _merge_list_component_updates(
+            [],
+            selected_path=None,
+            status_message="No MP3 files loaded to re-order.",
+        )
+        return [], display_update, dropdown_update, status_update
+
+    if not selected_track:
+        display_update, dropdown_update, status_update = _merge_list_component_updates(
+            current_state,
+            selected_path=None,
+            status_message="Select a track before adjusting the order.",
+        )
+        return current_state, display_update, dropdown_update, status_update
+
+    normalized = [os.path.abspath(os.path.expanduser(path)) for path in current_state]
+    try:
+        index = normalized.index(os.path.abspath(os.path.expanduser(selected_track)))
+    except ValueError:
+        display_update, dropdown_update, status_update = _merge_list_component_updates(
+            normalized,
+            selected_path=None,
+            status_message="The selected track is no longer in the list. Reload the MP3 list.",
+        )
+        return normalized, display_update, dropdown_update, status_update
+
+    new_index = index + direction
+    if new_index < 0 or new_index >= len(normalized):
+        direction_text = "up" if direction < 0 else "down"
+        display_update, dropdown_update, status_update = _merge_list_component_updates(
+            normalized,
+            selected_path=normalized[index],
+            status_message=f"Cannot move track {direction_text} any further.",
+        )
+        return normalized, display_update, dropdown_update, status_update
+
+    normalized[index], normalized[new_index] = normalized[new_index], normalized[index]
+    display_update, dropdown_update, status_update = _merge_list_component_updates(
+        normalized,
+        selected_path=normalized[new_index],
+        status_message="",
+    )
+    return normalized, display_update, dropdown_update, status_update
+
+
+def remove_merge_track(current_state, selected_track):
+    """Remove the selected track from the merge order."""
+    if not isinstance(current_state, list) or not current_state:
+        display_update, dropdown_update, status_update = _merge_list_component_updates(
+            [],
+            selected_path=None,
+            status_message="No MP3 files loaded to remove.",
+        )
+        return [], display_update, dropdown_update, status_update
+
+    if not selected_track:
+        display_update, dropdown_update, status_update = _merge_list_component_updates(
+            current_state,
+            selected_path=None,
+            status_message="Select a track to remove from the list.",
+        )
+        return current_state, display_update, dropdown_update, status_update
+
+    normalized = [os.path.abspath(os.path.expanduser(path)) for path in current_state]
+    selected_path = os.path.abspath(os.path.expanduser(selected_track))
+
+    try:
+        normalized.remove(selected_path)
+    except ValueError:
+        display_update, dropdown_update, status_update = _merge_list_component_updates(
+            normalized,
+            selected_path=None,
+            status_message="The selected track is no longer in the list. Reload the MP3 list.",
+        )
+        return normalized, display_update, dropdown_update, status_update
+
+    display_update, dropdown_update, status_update = _merge_list_component_updates(
+        normalized,
+        selected_path=None,
+        status_message="",
+    )
+    return normalized, display_update, dropdown_update, status_update
+
+
+def clear_merge_tracks(_current_state):
+    display_update, dropdown_update, status_update = _merge_list_component_updates(
+        [],
+        selected_path=None,
+        status_message="Cleared the MP3 list. Load files again to rebuild the merge order.",
+    )
+    return [], display_update, dropdown_update, status_update
+
+
 def merge_mp3_files(
+    ordered_files,
     mp3_files,
     keep_existing_chapters=True,
     output_filename="",
@@ -720,71 +969,31 @@ def merge_mp3_files(
         )
 
     file_paths = []
-    invalid_directories = []
-    if isinstance(mp3_files, list):
-        for item in mp3_files:
-            if isinstance(item, str) and item:
-                file_paths.append(item)
-            elif isinstance(item, dict):
-                path = item.get("name") or item.get("path")
-                if path:
-                    file_paths.append(path)
-    elif isinstance(mp3_files, str) and mp3_files:
-        file_paths.append(mp3_files)
+    if isinstance(ordered_files, list) and ordered_files:
+        for path in ordered_files:
+            if not path:
+                continue
+            absolute_path = os.path.abspath(os.path.expanduser(path))
+            if os.path.isfile(absolute_path) and absolute_path not in file_paths:
+                file_paths.append(absolute_path)
 
-    directories = []
-    if isinstance(mp3_directory, str):
-        if mp3_directory.strip():
-            directories.append(mp3_directory.strip())
-    elif isinstance(mp3_directory, list):
-        directories.extend([d.strip() for d in mp3_directory if isinstance(d, str) and d.strip()])
+    if not file_paths:
+        file_paths.extend(_parse_uploaded_mp3s(mp3_files))
+        directory_files, invalid_directories = _expand_mp3_directories(mp3_directory)
+        file_paths.extend([path for path in directory_files if path not in file_paths])
 
-    for directory in directories:
-        expanded_directory = os.path.abspath(os.path.expanduser(directory))
-        if not os.path.isdir(expanded_directory):
-            invalid_directories.append(directory)
-            continue
-
-        directory_files = [
-            path
-            for path in sorted(
-                glob.glob(os.path.join(expanded_directory, "**", "*.mp3"), recursive=True)
-            )
-            if os.path.isfile(path)
-        ]
-
-        if directory_files:
-            file_paths.extend(directory_files)
-        else:
-            invalid_directories.append(directory)
-
-    normalized_paths = []
-    seen = set()
-    for path in file_paths:
-        if not path:
-            continue
-        absolute_path = os.path.abspath(os.path.expanduser(path))
-        if not os.path.isfile(absolute_path):
-            continue
-        if absolute_path in seen:
-            continue
-        seen.add(absolute_path)
-        normalized_paths.append(absolute_path)
-
-    file_paths = normalized_paths
-
-    if invalid_directories:
-        invalid_list = ", ".join(sorted(set(invalid_directories)))
-        return (
-            gr.update(
-                value=(
-                    "The following directories are invalid or contain no MP3 files: "
-                    f"{invalid_list}."
+        if invalid_directories:
+            invalid_list = ", ".join(sorted(set(invalid_directories)))
+            return (
+                gr.update(
+                    value=(
+                        "The following directories are invalid or contain no MP3 files: "
+                        f"{invalid_list}."
+                    ),
+                    visible=True,
                 ),
-                visible=True,
-            ),
-            gr.update(value=None, visible=False),
-        )
+                gr.update(value=None, visible=False),
+            )
 
     if len(file_paths) < 2:
         return (
@@ -2212,6 +2421,28 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
                 label="Directory Containing MP3 Files (optional)",
                 placeholder="Provide a directory path to automatically load MP3 files",
             )
+            with gr.Row():
+                merge_load_button = gr.Button("Load MP3 List", variant="secondary")
+                merge_clear_button = gr.Button("Clear List")
+            merge_order_status = gr.Markdown(value="", visible=False)
+            merge_order_display = gr.Markdown(
+                value=(
+                    "No MP3 files loaded yet. Use **Load MP3 List** after selecting files or a directory to "
+                    "review the merge order."
+                ),
+                visible=True,
+            )
+            merge_selected_track = gr.Dropdown(
+                label="Track to adjust",
+                choices=[],
+                value=None,
+                interactive=False,
+                info="Select a track and use the buttons below to re-order or remove it.",
+            )
+            with gr.Row():
+                merge_move_up = gr.Button("Move Up")
+                merge_move_down = gr.Button("Move Down")
+                merge_remove_button = gr.Button("Remove Selected")
             merge_keep_chapters = gr.Checkbox(
                 label="Keep chapters",
                 value=True,
@@ -2256,6 +2487,7 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
             chapter_save_button = gr.Button("Save Chapter Titles", variant="primary", interactive=False)
 
         chapter_editor_state = gr.State({"path": "", "chapters": []})
+        merge_order_state = gr.State([])
 
     def process_media_upload(media_file, time_ranges):
         """Process uploaded media file and extract audio."""
@@ -3146,9 +3378,70 @@ with gr.Blocks(title="SECourses IndexTTS2 Premium App", theme=theme) as demo:
         ],
     )
 
+    merge_load_button.click(
+        load_merge_mp3_sources,
+        inputs=[
+            merge_mp3_inputs,
+            merge_mp3_directory,
+            merge_order_state,
+            merge_selected_track,
+        ],
+        outputs=[
+            merge_order_state,
+            merge_order_display,
+            merge_selected_track,
+            merge_order_status,
+        ],
+    )
+
+    merge_move_up.click(
+        lambda state, selected: move_merge_track(state, selected, -1),
+        inputs=[merge_order_state, merge_selected_track],
+        outputs=[
+            merge_order_state,
+            merge_order_display,
+            merge_selected_track,
+            merge_order_status,
+        ],
+    )
+
+    merge_move_down.click(
+        lambda state, selected: move_merge_track(state, selected, 1),
+        inputs=[merge_order_state, merge_selected_track],
+        outputs=[
+            merge_order_state,
+            merge_order_display,
+            merge_selected_track,
+            merge_order_status,
+        ],
+    )
+
+    merge_remove_button.click(
+        remove_merge_track,
+        inputs=[merge_order_state, merge_selected_track],
+        outputs=[
+            merge_order_state,
+            merge_order_display,
+            merge_selected_track,
+            merge_order_status,
+        ],
+    )
+
+    merge_clear_button.click(
+        clear_merge_tracks,
+        inputs=[merge_order_state],
+        outputs=[
+            merge_order_state,
+            merge_order_display,
+            merge_selected_track,
+            merge_order_status,
+        ],
+    )
+
     merge_button.click(
         merge_mp3_files,
         inputs=[
+            merge_order_state,
             merge_mp3_inputs,
             merge_keep_chapters,
             merge_output_name,
